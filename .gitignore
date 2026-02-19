@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.so
+
+# Environment & secrets
+.env
+*.env.local
+
+# Models (large binary files — use models-local/ with .gitkeep)
+models-local/*
+!models-local/.gitkeep
+
+# Node / Web Components build output
+node_modules/
+capabilities/*/ui/dist/
+modes/*/ui/dist/
+agent-webui/dist/
+
+# Docker volumes (if running outside compose)
+data/
+postgres-data/
+redis-data/
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo

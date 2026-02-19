@@ -1,0 +1,9 @@
+AIgentOS
+Copyright (c) 2026
+
+This repository uses a split-license model:
+- kernel/: MPL-2.0
+- agent-webui/: Apache-2.0
+- agent-prompts/: Apache-2.0
+
+See LICENSE and per-directory license files for details.
