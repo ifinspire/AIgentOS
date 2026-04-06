@@ -1,0 +1,16 @@
+.git
+.DS_Store
+*.pyc
+__pycache__
+.venv
+.env
+*.env.local
+agent-webui/node_modules
+agent-webui/dist
+models-local/*
+!models-local/.gitkeep
+baseline/
+*.log
+.pytest_cache
+.mypy_cache
+.ruff_cache

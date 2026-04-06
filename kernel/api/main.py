@@ -4,16 +4,18 @@ from pathlib import Path
 import time
 from datetime import datetime, timezone
 import asyncio
-import math
-import re
+import json
 import uuid
 
 from fastapi import FastAPI, HTTPException, Response, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 import httpx
 
-from .llm import ChatMessageIn, OllamaClient
+from kernel.shared.text import chunk_text, cosine_similarity, extract_visible_text
+from kernel.shared.metrics import estimate_tokens_for_messages, estimate_tokens_for_text, allocate_estimated_tokens
+
+from .llm import ChatMessageIn, OllamaClient, OllamaEmbeddingClient
 from .models import (
     BaselineJobStartResponse,
     BaselineStartRequest,
@@ -21,9 +23,10 @@ from .models import (
     BaselineCaseResult,
     BaselineCategoryResult,
     BaselineRunResponse,
+    ChatAcceptedResponse,
     ChatRequest,
-    ChatResponse,
     ConversationDetail,
+    ConversationEventsResponse,
     ConversationSummary,
     CreateConversationRequest,
     ContextSettingsResponse,
@@ -35,6 +38,8 @@ from .models import (
     PerformanceMetrics,
     PerformanceExchange,
     PerformanceSummaryResponse,
+    MemoryChunkListResponse,
+    MemoryChunkResponse,
     PromptComponentUpdateRequest,
     PromptProfileCreateRequest,
     PromptProfileResponse,
@@ -44,11 +49,12 @@ from .models import (
     SystemPromptResponse,
     TokenWindowStats,
     WarmupResponse,
+    InteractionEventResponse,
     MessageResponse,
 )
 from .prompts import compose_system_prompt, load_prompt_bundle, load_prompt_components
 from .settings import get_settings
-from .storage import ChatStore
+from .storage import ChatStore, StoredInteractionEvent
 
 
 settings = get_settings()
@@ -56,6 +62,7 @@ repo_root = Path(__file__).resolve().parents[2]
 prompt_bundle = load_prompt_bundle(repo_root=repo_root, default_agent_id=settings.default_agent_id)
 store = ChatStore(settings.chat_db_path)
 llm_client = OllamaClient(settings.ollama_base_url, settings.ollama_model)
+embedding_client = OllamaEmbeddingClient(settings.embedding_base_url, settings.embedding_model)
 _warmup_lock = asyncio.Lock()
 _warmup_completed_at: datetime | None = None
 _baseline_jobs: dict[str, dict] = {}
@@ -135,7 +142,7 @@ def _window_stats(window: tuple[int, int, int, int]) -> TokenWindowStats:
 
 app = FastAPI(
     title="AIgentOS Kernel API",
-    version="0.1.0",
+    version="0.2.0",
     description="Minimal OSS chat API wired to Ollama",
 )
 
@@ -148,19 +155,172 @@ app.add_middleware(
     )
 
 
-def _estimate_tokens_for_messages(messages: list[ChatMessageIn]) -> int:
-    char_count = sum(len(m.content or "") for m in messages)
-    return max(1, math.ceil(char_count / 4))
+
+# Utility aliases — implementations live in kernel.shared.text / kernel.shared.metrics
+_estimate_tokens_for_messages = estimate_tokens_for_messages
+_estimate_tokens_for_text = estimate_tokens_for_text
+_chunk_text = chunk_text
+_cosine_similarity = cosine_similarity
 
 
-def _estimate_tokens_for_text(text: str) -> int:
-    return max(1, math.ceil(len(text or "") / 4))
+async def _store_chunks_for_source(source_type: str, source_id: str, content: str) -> None:
+    chunks = _chunk_text(content)
+    if not chunks:
+        return
+    embedded_chunks: list[tuple[str, list[float]]] = []
+    for chunk in chunks:
+        try:
+            embedding = await embedding_client.embed(chunk)
+        except Exception:
+            return
+        embedded_chunks.append((chunk, embedding))
+    store.upsert_rag_chunks(source_type, source_id, embedded_chunks)
 
 
-def _extract_visible_assistant_text(text: str) -> str:
-    no_think = re.sub(r"<think>[\s\S]*?</think>", "", text or "", flags=re.IGNORECASE)
-    no_tags = re.sub(r"</?think>", "", no_think, flags=re.IGNORECASE)
-    return no_tags.strip()
+async def _retrieve_context_chunks(query: str, exclude_source_id: str | None = None, limit: int = 5) -> list[str]:
+    try:
+        query_embedding = await embedding_client.embed(query)
+    except Exception:
+        return []
+    scored: list[tuple[float, str]] = []
+    for chunk in store.iter_rag_chunks():
+        if exclude_source_id and chunk.source_id == exclude_source_id:
+            continue
+        score = _cosine_similarity(query_embedding, chunk.embedding)
+        if score <= 0:
+            continue
+        scored.append((score, chunk.content))
+    scored.sort(key=lambda item: item[0], reverse=True)
+    return [content for _, content in scored[:limit]]
+
+
+def _event_to_response(event: StoredInteractionEvent) -> InteractionEventResponse:
+    return InteractionEventResponse(
+        id=event.id,
+        conversation_id=event.conversation_id,
+        role=event.role,  # type: ignore[arg-type]
+        event_type=event.event_type,
+        content=event.content,
+        status=event.status,  # type: ignore[arg-type]
+        timestamp=event.created_at,
+        processed_at=event.processed_at,
+        error=event.error,
+        causation_event_id=event.causation_event_id,
+    )
+
+
+def _message_from_event(event: StoredInteractionEvent) -> MessageResponse:
+    return MessageResponse(
+        id=event.id,
+        role=event.role,  # type: ignore[arg-type]
+        content=event.content,
+        timestamp=event.created_at,
+    )
+
+
+def _conversation_events_payload(conversation_id: str) -> dict | None:
+    detail = store.get_conversation_detail(conversation_id)
+    if detail is None:
+        return None
+    title, updated_at, _ = detail
+    events = store.get_conversation_events(conversation_id)
+    latest_exchange = store.get_latest_performance_exchange_for_conversation(conversation_id)
+    summary = store.summarize_performance()
+    return {
+        "id": conversation_id,
+        "title": title,
+        "updated_at": updated_at.isoformat(),
+        "events": [
+            {
+                "id": event.id,
+                "conversation_id": event.conversation_id,
+                "role": event.role,
+                "event_type": event.event_type,
+                "content": event.content,
+                "status": event.status,
+                "timestamp": event.created_at.isoformat(),
+                "processed_at": event.processed_at.isoformat() if event.processed_at else None,
+                "error": event.error,
+                "causation_event_id": event.causation_event_id,
+            }
+            for event in events
+        ],
+        "latest_performance": (
+            {
+                "id": latest_exchange.id,
+                "conversation_id": latest_exchange.conversation_id,
+                "created_at": latest_exchange.created_at.isoformat(),
+                "user_preview": latest_exchange.user_preview,
+                "assistant_preview": latest_exchange.assistant_preview,
+                "metrics": {
+                    "total_latency_ms": latest_exchange.total_latency_ms,
+                    "llm_latency_ms": latest_exchange.llm_latency_ms,
+                    "ttft_ms": latest_exchange.ttft_ms,
+                    "prompt_tokens": latest_exchange.prompt_tokens,
+                    "completion_tokens": latest_exchange.completion_tokens,
+                    "total_tokens": latest_exchange.total_tokens,
+                    "retrieved_chunk_count": latest_exchange.retrieved_chunk_count,
+                    "retrieved_chunks": [
+                        {
+                            "content": chunk.content,
+                            "score": chunk.score,
+                            "source_id": chunk.source_id,
+                            "source_type": chunk.source_type,
+                            "source_preview": chunk.source_preview,
+                        }
+                        for chunk in latest_exchange.retrieved_chunks
+                    ],
+                    "prompt_breakdown": {
+                        "system_chars": latest_exchange.system_chars,
+                        "user_chars": latest_exchange.user_chars,
+                        "assistant_chars": latest_exchange.assistant_chars,
+                        "system_tokens_est": latest_exchange.system_tokens_est,
+                        "user_tokens_est": latest_exchange.user_tokens_est,
+                        "assistant_tokens_est": latest_exchange.assistant_tokens_est,
+                    },
+                },
+            }
+            if latest_exchange is not None
+            else None
+        ),
+        "performance_summary": {
+            "exchange_count": summary["exchange_count"],
+            "latency_min_ms": summary["latency_min_ms"],
+            "latency_max_ms": summary["latency_max_ms"],
+            "latency_avg_ms": summary["latency_avg_ms"],
+            "tokens_day": {
+                "total_tokens": summary["tokens_day"][0],
+                "prompt_tokens": summary["tokens_day"][1],
+                "completion_tokens": summary["tokens_day"][2],
+                "exchange_count": summary["tokens_day"][3],
+                "avg_tokens_per_exchange": 0.0 if summary["tokens_day"][3] == 0 else float(summary["tokens_day"][0]) / float(summary["tokens_day"][3]),
+            },
+            "tokens_week": {
+                "total_tokens": summary["tokens_week"][0],
+                "prompt_tokens": summary["tokens_week"][1],
+                "completion_tokens": summary["tokens_week"][2],
+                "exchange_count": summary["tokens_week"][3],
+                "avg_tokens_per_exchange": 0.0 if summary["tokens_week"][3] == 0 else float(summary["tokens_week"][0]) / float(summary["tokens_week"][3]),
+            },
+            "tokens_month": {
+                "total_tokens": summary["tokens_month"][0],
+                "prompt_tokens": summary["tokens_month"][1],
+                "completion_tokens": summary["tokens_month"][2],
+                "exchange_count": summary["tokens_month"][3],
+                "avg_tokens_per_exchange": 0.0 if summary["tokens_month"][3] == 0 else float(summary["tokens_month"][0]) / float(summary["tokens_month"][3]),
+            },
+            "tokens_all_time": {
+                "total_tokens": summary["tokens_all_time"][0],
+                "prompt_tokens": summary["tokens_all_time"][1],
+                "completion_tokens": summary["tokens_all_time"][2],
+                "exchange_count": summary["tokens_all_time"][3],
+                "avg_tokens_per_exchange": 0.0 if summary["tokens_all_time"][3] == 0 else float(summary["tokens_all_time"][0]) / float(summary["tokens_all_time"][3]),
+            },
+        },
+    }
+
+
+_extract_visible_assistant_text = extract_visible_text
 
 
 def _should_refresh_conversation_summary(exchange_count: int) -> bool:
@@ -266,6 +426,7 @@ async def _run_single_turn_case(
         label=label,
         calls=1,
         input_tokens_est=_estimate_tokens_for_text(user_payload),
+        ttft_ms=completion.ttft_ms,
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
         total_tokens=total_tokens,
@@ -273,6 +434,7 @@ async def _run_single_turn_case(
         avg_latency_ms=float(latency_ms),
         min_latency_ms=latency_ms,
         max_latency_ms=latency_ms,
+        completion_time_ms=latency_ms,
     )
 
 
@@ -307,6 +469,7 @@ async def _run_system_prompt_pressure_case(
         label=label,
         calls=1,
         input_tokens_est=_estimate_tokens_for_text(user_payload),
+        ttft_ms=completion.ttft_ms,
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
         total_tokens=total_tokens,
@@ -314,6 +477,7 @@ async def _run_system_prompt_pressure_case(
         avg_latency_ms=float(latency_ms),
         min_latency_ms=latency_ms,
         max_latency_ms=latency_ms,
+        completion_time_ms=latency_ms,
     )
 
 
@@ -335,6 +499,7 @@ async def _run_multi_turn_case(
     token_total = 0
     latency_total = 0
     per_turn_latency_ms: list[int] = []
+    per_turn_ttft_ms: list[int] = []
     per_turn_prompt_tokens: list[int] = []
     per_turn_completion_tokens: list[int] = []
     input_total = 0
@@ -350,6 +515,10 @@ async def _run_multi_turn_case(
         latency_ms = int((time.perf_counter() - started) * 1000)
         latency_total += latency_ms
         per_turn_latency_ms.append(latency_ms)
+        if completion.ttft_ms is not None:
+            per_turn_ttft_ms.append(completion.ttft_ms)
+        else:
+            per_turn_ttft_ms.append(latency_ms)
         prompt_tokens = completion.prompt_tokens if completion.prompt_tokens is not None else _estimate_tokens_for_messages(messages)
         completion_tokens = completion.completion_tokens if completion.completion_tokens is not None else _estimate_tokens_for_text(completion.content)
         total_tokens = completion.total_tokens if completion.total_tokens is not None else prompt_tokens + completion_tokens
@@ -368,6 +537,7 @@ async def _run_multi_turn_case(
         label=label,
         calls=calls,
         input_tokens_est=input_total,
+        ttft_ms=min(per_turn_ttft_ms) if per_turn_ttft_ms else None,
         prompt_tokens=prompt_total,
         completion_tokens=completion_total,
         total_tokens=token_total,
@@ -375,7 +545,9 @@ async def _run_multi_turn_case(
         avg_latency_ms=(float(latency_total) / float(calls)) if calls > 0 else 0.0,
         min_latency_ms=min(per_turn_latency_ms) if per_turn_latency_ms else None,
         max_latency_ms=max(per_turn_latency_ms) if per_turn_latency_ms else None,
+        completion_time_ms=max(per_turn_latency_ms) if per_turn_latency_ms else None,
         per_turn_latency_ms=per_turn_latency_ms,
+        per_turn_ttft_ms=per_turn_ttft_ms,
         per_turn_prompt_tokens=per_turn_prompt_tokens,
         per_turn_completion_tokens=per_turn_completion_tokens,
     )
@@ -575,8 +747,23 @@ async def health() -> HealthResponse:
         tenant_id=settings.aigent_tenant_id,
         model=settings.ollama_model,
         ollama_base_url=settings.ollama_base_url,
+        embedding_base_url=settings.embedding_base_url,
         is_warm=_warmup_completed_at is not None,
     )
+
+
+@app.get("/api/worker/health")
+async def worker_health() -> dict:
+    last_seen = store.get_worker_heartbeat()
+    if last_seen is None:
+        return {"status": "unknown", "last_seen": None, "message": "Worker has not reported in yet"}
+    age_seconds = (datetime.now(timezone.utc) - last_seen).total_seconds()
+    healthy = age_seconds < 30
+    return {
+        "status": "healthy" if healthy else "stale",
+        "last_seen": last_seen.isoformat(),
+        "age_seconds": round(age_seconds, 1),
+    }
 
 
 @app.post("/api/llm/warmup", response_model=WarmupResponse)
@@ -636,6 +823,7 @@ async def export_all_data() -> dict:
         "version": "aigentos-export-v1",
         "model": settings.ollama_model,
         "ollama_base_url": settings.ollama_base_url,
+        "embedding_base_url": settings.embedding_base_url,
         "data": snapshot,
     }
 
@@ -648,6 +836,7 @@ async def get_context_settings() -> ContextSettingsResponse:
         max_response_tokens=current.max_response_tokens,
         compact_trigger_pct=current.compact_trigger_pct,
         compact_instructions=current.compact_instructions,
+        memory_enabled=current.memory_enabled,
         updated_at=current.updated_at,
     )
 
@@ -660,14 +849,46 @@ async def update_context_settings(payload: ContextSettingsUpdateRequest) -> Cont
         max_response_tokens=payload.max_response_tokens,
         compact_trigger_pct=payload.compact_trigger_pct,
         compact_instructions=payload.compact_instructions,
+        memory_enabled=payload.memory_enabled,
     )
     return ContextSettingsResponse(
         max_context_tokens=current.max_context_tokens,
         max_response_tokens=current.max_response_tokens,
         compact_trigger_pct=current.compact_trigger_pct,
         compact_instructions=current.compact_instructions,
+        memory_enabled=current.memory_enabled,
         updated_at=current.updated_at,
     )
+
+
+@app.get("/api/memory/chunks", response_model=MemoryChunkListResponse)
+async def list_memory_chunks(limit: int = 200) -> MemoryChunkListResponse:
+    safe_limit = max(1, min(limit, 1000))
+    context = _get_context_settings()
+    chunks = store.list_rag_chunks(limit=safe_limit)
+    return MemoryChunkListResponse(
+        memory_enabled=context.memory_enabled,
+        chunks=[
+            MemoryChunkResponse(
+                id=chunk.id,
+                source_type=chunk.source_type,
+                source_id=chunk.source_id,
+                content=chunk.content,
+                created_at=chunk.created_at,
+                embedding_dimensions=len(chunk.embedding),
+                content_tokens_est=_estimate_tokens_for_text(chunk.content),
+            )
+            for chunk in chunks
+        ],
+    )
+
+
+@app.delete("/api/memory/chunks/{chunk_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_memory_chunk(chunk_id: str) -> Response:
+    ok = store.delete_rag_chunk(chunk_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Memory chunk not found")
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @app.get("/api/prompts/system", response_model=SystemPromptResponse)
@@ -814,15 +1035,61 @@ async def get_conversation(conversation_id: str) -> ConversationDetail:
         id=conversation_id,
         title=title,
         updated_at=updated_at,
-        messages=[
-            MessageResponse(
-                id=m.id,
-                role=m.role,  # type: ignore[arg-type]
-                content=m.content,
-                timestamp=m.created_at,
-            )
-            for m in messages
-        ],
+        messages=[MessageResponse(id=m.id, role=m.role, content=m.content, timestamp=m.created_at) for m in messages],  # type: ignore[list-item]
+    )
+
+
+@app.get("/api/conversations/{conversation_id}/events", response_model=ConversationEventsResponse)
+async def get_conversation_events(conversation_id: str) -> ConversationEventsResponse:
+    detail = store.get_conversation_detail(conversation_id)
+    if detail is None:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    title, updated_at, _ = detail
+    events = store.get_conversation_events(conversation_id)
+    return ConversationEventsResponse(
+        id=conversation_id,
+        title=title,
+        updated_at=updated_at,
+        events=[_event_to_response(event) for event in events],
+    )
+
+
+@app.get("/api/conversations/{conversation_id}/stream")
+async def stream_conversation_events(conversation_id: str) -> StreamingResponse:
+    if not store.ensure_conversation(conversation_id):
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    async def event_generator():
+        last_payload = ""
+        idle_pings = 0
+        max_idle_pings = 1500  # ~5 minutes at 0.2s intervals
+        try:
+            while idle_pings < max_idle_pings:
+                payload = _conversation_events_payload(conversation_id)
+                if payload is None:
+                    yield "event: error\ndata: {\"detail\":\"Conversation not found\"}\n\n"
+                    return
+                serialized = json.dumps(payload)
+                if serialized != last_payload:
+                    last_payload = serialized
+                    idle_pings = 0
+                    yield f"event: conversation\ndata: {serialized}\n\n"
+                else:
+                    idle_pings += 1
+                    yield "event: ping\ndata: {}\n\n"
+                await asyncio.sleep(0.2)
+            yield "event: timeout\ndata: {\"detail\":\"Stream idle timeout\"}\n\n"
+        except asyncio.CancelledError:
+            return
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
     )
 
 
@@ -848,6 +1115,7 @@ async def recent_performance(limit: int = 5) -> list[PerformanceExchange]:
             metrics=PerformanceMetrics(
                 total_latency_ms=row.total_latency_ms,
                 llm_latency_ms=row.llm_latency_ms,
+                ttft_ms=row.ttft_ms,
                 prompt_tokens=row.prompt_tokens,
                 completion_tokens=row.completion_tokens,
                 total_tokens=row.total_tokens,
@@ -990,9 +1258,21 @@ async def debug_logs(limit: int = 50) -> list[DebugLogResponse]:
                     "metrics": {
                         "total_latency_ms": row.total_latency_ms,
                         "llm_latency_ms": row.llm_latency_ms,
+                        "ttft_ms": row.ttft_ms,
                         "prompt_tokens": row.prompt_tokens,
                         "completion_tokens": row.completion_tokens,
                         "total_tokens": row.total_tokens,
+                        "retrieved_chunk_count": row.retrieved_chunk_count,
+                        "retrieved_chunks": [
+                            {
+                                "content": chunk.content,
+                                "score": chunk.score,
+                                "source_id": chunk.source_id,
+                                "source_type": chunk.source_type,
+                                "source_preview": chunk.source_preview,
+                            }
+                            for chunk in row.retrieved_chunks
+                        ],
                         "prompt_breakdown": {
                             "system_chars": row.system_chars,
                             "user_chars": row.user_chars,
@@ -1008,20 +1288,11 @@ async def debug_logs(limit: int = 50) -> list[DebugLogResponse]:
     return result
 
 
-def _allocate_estimated_tokens(total: int | None, system_chars: int, user_chars: int, assistant_chars: int) -> tuple[int | None, int | None, int | None]:
-    if total is None:
-        return None, None, None
-    total_chars = system_chars + user_chars + assistant_chars
-    if total_chars <= 0:
-        return 0, 0, 0
-    system_est = round(total * system_chars / total_chars)
-    user_est = round(total * user_chars / total_chars)
-    assistant_est = total - system_est - user_est
-    return system_est, user_est, assistant_est
+_allocate_estimated_tokens = allocate_estimated_tokens
 
 
-@app.post("/api/chat", response_model=ChatResponse)
-async def chat(payload: ChatRequest) -> ChatResponse:
+@app.post("/api/chat", response_model=ChatAcceptedResponse, status_code=status.HTTP_202_ACCEPTED)
+async def chat(payload: ChatRequest) -> ChatAcceptedResponse:
     if payload.conversation_id:
         if not store.ensure_conversation(payload.conversation_id):
             raise HTTPException(status_code=404, detail="Conversation not found")
@@ -1029,127 +1300,17 @@ async def chat(payload: ChatRequest) -> ChatResponse:
     else:
         conversation_id, _ = store.create_conversation()
 
-    user_message = store.add_message(conversation_id, "user", payload.message)
+    user_event = store.create_interaction_event(
+        conversation_id=conversation_id,
+        role="user",
+        content=payload.message,
+        status="pending",
+    )
     store.maybe_set_title_from_message(conversation_id, payload.message)
-
-    _, effective_components = _effective_prompt_components()
-    effective_prompt = compose_system_prompt(effective_components)
-    context_settings = _get_context_settings()
-
-    history = store.get_messages(conversation_id)
-    history_messages = [
-        ChatMessageIn(role=m.role, content=m.content)
-        for m in history
-        if m.role in {"user", "assistant"}
-    ]
-    llm_messages = [ChatMessageIn(role="system", content=effective_prompt), *history_messages]
-
-    est_prompt_tokens_before = _estimate_tokens_for_messages(llm_messages)
-    compact_threshold = int(context_settings.max_context_tokens * context_settings.compact_trigger_pct)
-    compaction_applied = False
-    dropped_history_messages = 0
-    if context_settings.compact_instructions.strip() and est_prompt_tokens_before >= compact_threshold:
-        llm_messages.insert(
-            1,
-            ChatMessageIn(
-                role="system",
-                content=context_settings.compact_instructions.strip(),
-            ),
-        )
-        compaction_applied = True
-
-    while len(llm_messages) > 2 and _estimate_tokens_for_messages(llm_messages) > context_settings.max_context_tokens:
-        # Drop the oldest non-system message first.
-        llm_messages.pop(2)
-        dropped_history_messages += 1
-
-    est_prompt_tokens_after = _estimate_tokens_for_messages(llm_messages)
-
-    system_chars = sum(len(m.content) for m in llm_messages if m.role == "system")
-    user_chars = sum(len(m.content) for m in llm_messages if m.role == "user")
-    assistant_chars = sum(len(m.content) for m in llm_messages if m.role == "assistant")
-
-    try:
-        started = time.perf_counter()
-        completion = await llm_client.chat(
-            llm_messages,
-            max_tokens=context_settings.max_response_tokens,
-        )
-        total_latency_ms = int((time.perf_counter() - started) * 1000)
-    except httpx.HTTPStatusError as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Ollama request failed with status {exc.response.status_code}",
-        ) from exc
-    except httpx.HTTPError as exc:
-        raise HTTPException(status_code=502, detail="Failed to connect to Ollama") from exc
-    except RuntimeError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-
-    assistant_message = store.add_message(conversation_id, "assistant", completion.content)
-
-    system_tokens_est, user_tokens_est, assistant_tokens_est = _allocate_estimated_tokens(
-        completion.prompt_tokens,
-        system_chars,
-        user_chars,
-        assistant_chars,
-    )
-
-    store.add_performance_exchange(
+    return ChatAcceptedResponse(
         conversation_id=conversation_id,
-        user_preview=payload.message.strip()[:160],
-        assistant_preview=completion.content.strip()[:160],
-        total_latency_ms=total_latency_ms,
-        llm_latency_ms=completion.latency_ms,
-        prompt_tokens=completion.prompt_tokens,
-        completion_tokens=completion.completion_tokens,
-        total_tokens=completion.total_tokens,
-        system_chars=system_chars,
-        user_chars=user_chars,
-        assistant_chars=assistant_chars,
-        system_tokens_est=system_tokens_est,
-        user_tokens_est=user_tokens_est,
-        assistant_tokens_est=assistant_tokens_est,
-    )
-
-    await _refresh_conversation_summary(conversation_id)
-
-    return ChatResponse(
-        conversation_id=conversation_id,
-        user_message=MessageResponse(
-            id=user_message.id,
-            role="user",
-            content=user_message.content,
-            timestamp=user_message.created_at,
-        ),
-        assistant_message=MessageResponse(
-            id=assistant_message.id,
-            role="assistant",
-            content=assistant_message.content,
-            timestamp=assistant_message.created_at,
-        ),
-        performance=PerformanceMetrics(
-            total_latency_ms=total_latency_ms,
-            llm_latency_ms=completion.latency_ms,
-            prompt_tokens=completion.prompt_tokens,
-            completion_tokens=completion.completion_tokens,
-            total_tokens=completion.total_tokens,
-            prompt_breakdown=PromptBreakdown(
-                system_chars=system_chars,
-                user_chars=user_chars,
-                assistant_chars=assistant_chars,
-                system_tokens_est=system_tokens_est,
-                user_tokens_est=user_tokens_est,
-                assistant_tokens_est=assistant_tokens_est,
-            ),
-            context_compaction={
-                "applied": compaction_applied or dropped_history_messages > 0,
-                "trigger_tokens": compact_threshold,
-                "estimated_prompt_tokens_before": est_prompt_tokens_before,
-                "estimated_prompt_tokens_after": est_prompt_tokens_after,
-                "dropped_history_messages": dropped_history_messages,
-            },
-        ),
+        event_id=user_event.id,
+        accepted_at=user_event.created_at,
     )
 
 

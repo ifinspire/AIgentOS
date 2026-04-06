@@ -149,7 +149,7 @@ export function SettingsModal({
                   Version
                 </div>
                 <div className="font-medium" style={{ color: 'var(--aigent-color-text)' }}>
-                  v0.1.0-alpha
+                  v0.2.0-oss
                 </div>
               </div>
 

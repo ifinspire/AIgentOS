@@ -1,6 +1,6 @@
-import { Activity, Cpu, Database, ChevronLeft, ChevronRight, FileText, Bug, FlaskConical } from 'lucide-react';
+import { Activity, Cpu, Database, ChevronLeft, ChevronRight, FileText, Bug, FlaskConical, Brain } from 'lucide-react';
 
-export type DashboardSection = 'prompts' | 'performance' | 'baseline' | 'debug' | 'database' | 'logs';
+export type DashboardSection = 'prompts' | 'performance' | 'baseline' | 'memory' | 'debug' | 'database' | 'logs';
 
 interface DashboardSidebarProps {
   activeSection: DashboardSection;
@@ -13,6 +13,7 @@ const sections = [
   { id: 'prompts' as DashboardSection, label: 'Prompts', icon: FileText },
   { id: 'performance' as DashboardSection, label: 'Performance', icon: Activity },
   { id: 'baseline' as DashboardSection, label: 'Baseline', icon: FlaskConical },
+  { id: 'memory' as DashboardSection, label: 'Memory', icon: Brain },
   { id: 'debug' as DashboardSection, label: 'Debug', icon: Bug },
   { id: 'database' as DashboardSection, label: 'Database', icon: Database },
   { id: 'logs' as DashboardSection, label: 'Logs', icon: Cpu }
@@ -110,7 +111,7 @@ export function DashboardSidebar({
           </div>
           <div className="flex justify-between">
             <span>Version</span>
-            <span className="font-medium" style={{ color: 'var(--aigent-color-text)' }}>v0.1.0</span>
+            <span className="font-medium" style={{ color: 'var(--aigent-color-text)' }}>v0.2.0</span>
           </div>
         </div>
       </div>

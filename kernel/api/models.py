@@ -12,11 +12,12 @@ class HealthResponse(BaseModel):
     tenant_id: str
     model: str
     ollama_base_url: str
+    embedding_base_url: str
     is_warm: bool
 
 
 class ChatRequest(BaseModel):
-    message: str = Field(..., min_length=1, max_length=10000)
+    message: str = Field(..., min_length=1, max_length=100_000)
     conversation_id: str | None = None
 
 
@@ -25,6 +26,19 @@ class MessageResponse(BaseModel):
     role: Role
     content: str
     timestamp: datetime
+
+
+class InteractionEventResponse(BaseModel):
+    id: str
+    conversation_id: str
+    role: Role
+    event_type: str
+    content: str
+    status: Literal["pending", "processing", "completed", "failed"]
+    timestamp: datetime
+    processed_at: datetime | None = None
+    error: str | None = None
+    causation_event_id: str | None = None
 
 
 class ConversationSummary(BaseModel):
@@ -40,6 +54,13 @@ class ConversationDetail(BaseModel):
     title: str
     updated_at: datetime
     messages: list[MessageResponse]
+
+
+class ConversationEventsResponse(BaseModel):
+    id: str
+    title: str
+    updated_at: datetime
+    events: list[InteractionEventResponse]
 
 
 class PromptBreakdown(BaseModel):
@@ -59,12 +80,23 @@ class ContextCompactionMetrics(BaseModel):
     dropped_history_messages: int
 
 
+class RetrievedMemoryChunk(BaseModel):
+    content: str
+    score: float
+    source_id: str
+    source_type: str
+    source_preview: str
+
+
 class PerformanceMetrics(BaseModel):
     total_latency_ms: int
     llm_latency_ms: int
+    ttft_ms: int | None = None
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
     total_tokens: int | None = None
+    retrieved_chunk_count: int = 0
+    retrieved_chunks: list[RetrievedMemoryChunk] = Field(default_factory=list)
     prompt_breakdown: PromptBreakdown
     context_compaction: ContextCompactionMetrics | None = None
 
@@ -141,6 +173,7 @@ class ContextSettingsResponse(BaseModel):
     max_response_tokens: int
     compact_trigger_pct: float
     compact_instructions: str
+    memory_enabled: bool
     updated_at: datetime
 
 
@@ -149,6 +182,22 @@ class ContextSettingsUpdateRequest(BaseModel):
     max_response_tokens: int | None = Field(default=None, ge=16, le=262144)
     compact_trigger_pct: float | None = Field(default=None, ge=0.1, le=1.0)
     compact_instructions: str | None = None
+    memory_enabled: bool | None = None
+
+
+class MemoryChunkResponse(BaseModel):
+    id: str
+    source_type: str
+    source_id: str
+    content: str
+    created_at: datetime
+    embedding_dimensions: int
+    content_tokens_est: int
+
+
+class MemoryChunkListResponse(BaseModel):
+    memory_enabled: bool
+    chunks: list[MemoryChunkResponse]
 
 
 class TokenWindowStats(BaseModel):
@@ -170,11 +219,10 @@ class PerformanceSummaryResponse(BaseModel):
     tokens_all_time: TokenWindowStats
 
 
-class ChatResponse(BaseModel):
+class ChatAcceptedResponse(BaseModel):
     conversation_id: str
-    user_message: MessageResponse
-    assistant_message: MessageResponse
-    performance: PerformanceMetrics
+    event_id: str
+    accepted_at: datetime
 
 
 class CreateConversationRequest(BaseModel):
@@ -195,6 +243,7 @@ class BaselineCaseResult(BaseModel):
     label: str
     calls: int
     input_tokens_est: int
+    ttft_ms: int | None = None
     prompt_tokens: int
     completion_tokens: int
     total_tokens: int
@@ -202,7 +251,9 @@ class BaselineCaseResult(BaseModel):
     avg_latency_ms: float
     min_latency_ms: int | None = None
     max_latency_ms: int | None = None
+    completion_time_ms: int | None = None
     per_turn_latency_ms: list[int] | None = None
+    per_turn_ttft_ms: list[int] | None = None
     per_turn_prompt_tokens: list[int] | None = None
     per_turn_completion_tokens: list[int] | None = None
 

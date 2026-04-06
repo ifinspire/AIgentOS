@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { Toaster, toast } from "sonner";
-import { Activity, Bot, Cpu, Database, MessageSquare, Zap } from "lucide-react";
+import { Activity, Bot, Brain, Cpu, Database, MessageSquare, Trash2, Zap } from "lucide-react";
 
 import { Header } from "./components/header";
 import { Footer } from "./components/footer";
@@ -17,6 +17,8 @@ import {
   ApiContextSettings,
   ApiConversationSummary,
   ApiDebugLog,
+  ApiInteractionEvent,
+  ApiMemoryChunk,
   ApiMessage,
   ApiPerformanceExchange,
   ApiPerformanceMetrics,
@@ -61,12 +63,17 @@ interface PerfExchange {
   perf: ApiPerformanceMetrics;
 }
 
+interface MemoryChunkView extends ApiMemoryChunk {}
+
 const EMPTY_PERF: ApiPerformanceMetrics = {
   total_latency_ms: 0,
   llm_latency_ms: 0,
+  ttft_ms: null,
   prompt_tokens: null,
   completion_tokens: null,
   total_tokens: null,
+  retrieved_chunk_count: 0,
+  retrieved_chunks: [],
   prompt_breakdown: {
     system_chars: 0,
     user_chars: 0,
@@ -93,6 +100,74 @@ function formatRelative(ts: string) {
 function formatMs(ms: number) {
   if (ms < 1000) return `${ms}ms`;
   return `${(ms / 1000).toFixed(2)}s`;
+}
+
+function formatTokensPerSecond(completionTokens: number | null | undefined, latencyMs: number | null | undefined) {
+  if (completionTokens == null || latencyMs == null || latencyMs <= 0) return "-";
+  const tps = completionTokens / (latencyMs / 1000);
+  if (!Number.isFinite(tps) || tps <= 0) return "-";
+  return `${tps.toFixed(1)} tok/s`;
+}
+
+function computeTokensPerSecond(completionTokens: number | null | undefined, latencyMs: number | null | undefined) {
+  if (completionTokens == null || latencyMs == null || latencyMs <= 0) return null;
+  const tps = completionTokens / (latencyMs / 1000);
+  if (!Number.isFinite(tps) || tps <= 0) return null;
+  return tps;
+}
+
+function summarizeBaseline(result: ApiBaselineRunResponse) {
+  const ttftValues: number[] = [];
+  const throughputValues: number[] = [];
+
+  for (const category of result.categories) {
+    for (const baselineCase of category.cases) {
+      if (baselineCase.per_turn_latency_ms && baselineCase.per_turn_latency_ms.length > 0) {
+        for (let idx = 0; idx < baselineCase.per_turn_latency_ms.length; idx += 1) {
+          const ttft = baselineCase.per_turn_ttft_ms?.[idx];
+          if (typeof ttft === "number" && ttft > 0) {
+            ttftValues.push(ttft);
+          }
+          const completionTokens = baselineCase.per_turn_completion_tokens?.[idx] ?? null;
+          const latencyMs = baselineCase.per_turn_latency_ms[idx];
+          const throughput = computeTokensPerSecond(completionTokens, latencyMs);
+          if (throughput != null) {
+            throughputValues.push(throughput);
+          }
+        }
+        continue;
+      }
+
+      if (typeof baselineCase.ttft_ms === "number" && baselineCase.ttft_ms > 0) {
+        ttftValues.push(baselineCase.ttft_ms);
+      }
+      const throughput = computeTokensPerSecond(
+        baselineCase.completion_tokens,
+        baselineCase.completion_time_ms ?? baselineCase.total_latency_ms,
+      );
+      if (throughput != null) {
+        throughputValues.push(throughput);
+      }
+    }
+  }
+
+  const avgTtftMs =
+    ttftValues.length > 0
+      ? Math.round(ttftValues.reduce((sum, value) => sum + value, 0) / ttftValues.length)
+      : null;
+  const avgThroughput =
+    throughputValues.length > 0
+      ? throughputValues.reduce((sum, value) => sum + value, 0) / throughputValues.length
+      : null;
+
+  return {
+    avgTtftMs,
+    avgThroughput,
+    minTtftMs: ttftValues.length > 0 ? Math.min(...ttftValues) : null,
+    maxTtftMs: ttftValues.length > 0 ? Math.max(...ttftValues) : null,
+    minThroughput: throughputValues.length > 0 ? Math.min(...throughputValues) : null,
+    maxThroughput: throughputValues.length > 0 ? Math.max(...throughputValues) : null,
+  };
 }
 
 function ellipsize(text: string, max = 80) {
@@ -151,6 +226,64 @@ function mapApiMessage(message: ApiMessage): Message {
   };
 }
 
+function mapApiEvent(event: ApiInteractionEvent): Message | null {
+  if (event.role !== "user" && event.role !== "assistant") return null;
+  const parsed =
+    event.role === "assistant"
+      ? parseAssistantContent(event.content)
+      : { visible: event.content, reasoning: undefined };
+  return {
+    id: event.id,
+    variant: event.role === "user" ? "user" : "agent",
+    content: parsed.visible,
+    reasoning: parsed.reasoning,
+    timestamp: formatTime(event.timestamp),
+  };
+}
+
+function mapConversationEvents(events: ApiInteractionEvent[]): Message[] {
+  return events
+    .map(mapApiEvent)
+    .filter((item): item is Message => item !== null);
+}
+
+function buildCapabilityMessage(events: ApiInteractionEvent[], perf?: ApiPerformanceExchange | null) {
+  const userEvents = events.filter((event) => event.role === "user");
+  const assistantEvents = events.filter((event) => event.role === "assistant");
+  const latestUser = userEvents[userEvents.length - 1];
+  const latestAssistant = assistantEvents[assistantEvents.length - 1];
+
+  if (latestUser?.status === "failed") {
+    return { status: "error" as const, message: latestUser.error || "Message processing failed" };
+  }
+  if (latestAssistant?.status === "failed") {
+    return { status: "error" as const, message: latestAssistant.error || "Assistant response failed" };
+  }
+  if (latestAssistant?.status === "completed") {
+    const compaction = perf?.metrics.context_compaction;
+    if (perf) {
+      if (compaction?.applied) {
+        return {
+          status: "success" as const,
+          message: `Done in ${formatMs(perf.metrics.total_latency_ms)} · Context compacted (${compaction.dropped_history_messages} old messages dropped)`,
+        };
+      }
+      return {
+        status: "success" as const,
+        message: `Done in ${formatMs(perf.metrics.total_latency_ms)}`,
+      };
+    }
+    return { status: "success" as const, message: "Response complete" };
+  }
+  if (latestAssistant?.status === "processing") {
+    return { status: "processing" as const, message: "Streaming response..." };
+  }
+  if (latestUser?.status === "processing") {
+    return { status: "processing" as const, message: "Thinking..." };
+  }
+  return { status: "processing" as const, message: "Queued for worker..." };
+}
+
 function mapConversation(item: ApiConversationSummary, activeId: string | null): Conversation {
   return {
     id: item.id,
@@ -182,7 +315,6 @@ export default function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [latestPerf, setLatestPerf] = useState<ApiPerformanceMetrics>(EMPTY_PERF);
   const [perfHistory, setPerfHistory] = useState<PerfExchange[]>([]);
-  const [telemetryMissingWarned, setTelemetryMissingWarned] = useState(false);
   const [runtimeModel, setRuntimeModel] = useState("unknown");
   const [backendConnected, setBackendConnected] = useState(false);
   const [apiEndpoint, setApiEndpoint] = useState(API_BASE_URL);
@@ -197,12 +329,17 @@ export default function App() {
     max_response_tokens: string;
     compact_trigger_pct: string;
     compact_instructions: string;
+    memory_enabled: boolean;
   }>({
-    max_response_tokens: "512",
+    max_response_tokens: "1024",
     compact_trigger_pct: "0.9",
     compact_instructions: "",
+    memory_enabled: true,
   });
   const [debugLogs, setDebugLogs] = useState<ApiDebugLog[]>([]);
+  const [memoryChunks, setMemoryChunks] = useState<MemoryChunkView[]>([]);
+  const [memoryEnabled, setMemoryEnabled] = useState(true);
+  const [memoryLoading, setMemoryLoading] = useState(false);
   const [expandedDebugIds, setExpandedDebugIds] = useState<Record<string, boolean>>({});
   const [inputResetSignal, setInputResetSignal] = useState(0);
   const [baselineRunning, setBaselineRunning] = useState(false);
@@ -211,6 +348,7 @@ export default function App() {
   const [baselineJobId, setBaselineJobId] = useState<string | null>(null);
   const [baselineEnforceMaxResponseTokens, setBaselineEnforceMaxResponseTokens] = useState(true);
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
+  const streamRef = useRef<EventSource | null>(null);
 
   const [conversationsSidebarCollapsed, setConversationsSidebarCollapsed] = useState(false);
   const [updatesPanelCollapsed, setUpdatesPanelCollapsed] = useState(false);
@@ -225,19 +363,20 @@ export default function App() {
   };
 
   const loadConversation = async (conversationId: string) => {
-    const detail = await api.getConversation(conversationId);
+    const detail = await api.getConversationEvents(conversationId);
     setActiveConversationId(conversationId);
-    setMessages(detail.messages.map(mapApiMessage));
+    setMessages(mapConversationEvents(detail.events));
     await refreshConversations(conversationId);
   };
 
   const loadDashboardData = async () => {
-    const [promptData, componentsData, summaryData, contextData, debugData] = await Promise.all([
+    const [promptData, componentsData, summaryData, contextData, debugData, memoryData] = await Promise.all([
       api.getSystemPrompt(),
       api.getPromptComponents(),
       api.getPerformanceSummary(),
       api.getContextSettings(),
       api.getDebugLogs(50),
+      api.getMemoryChunks(200),
     ]);
     setSystemPrompt(promptData);
     setPromptComponents(componentsData);
@@ -247,7 +386,10 @@ export default function App() {
       max_response_tokens: String(contextData.max_response_tokens),
       compact_trigger_pct: String(contextData.compact_trigger_pct),
       compact_instructions: contextData.compact_instructions || "",
+      memory_enabled: contextData.memory_enabled,
     });
+    setMemoryEnabled(memoryData.memory_enabled);
+    setMemoryChunks(memoryData.chunks);
     setPromptContentDrafts(Object.fromEntries(componentsData.map((c) => [c.id, c.content])));
     setPromptEnabledDrafts(Object.fromEntries(componentsData.map((c) => [c.id, c.enabled])));
     setDebugLogs(debugData);
@@ -346,7 +488,7 @@ export default function App() {
 
   useEffect(() => {
     if (currentView !== "dashboard") return;
-    if (dashboardSection === "prompts" || dashboardSection === "debug") {
+    if (dashboardSection === "prompts" || dashboardSection === "debug" || dashboardSection === "memory") {
       void loadDashboardData();
     }
   }, [currentView, dashboardSection]);
@@ -355,6 +497,70 @@ export default function App() {
     if (currentView !== "chat") return;
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [messages, isProcessing, currentView]);
+
+  useEffect(() => {
+    if (streamRef.current) {
+      streamRef.current.close();
+      streamRef.current = null;
+    }
+    if (!activeConversationId) return;
+
+    const source = new EventSource(api.conversationStreamUrl(activeConversationId));
+    streamRef.current = source;
+
+    source.addEventListener("conversation", (rawEvent) => {
+      const event = rawEvent as MessageEvent<string>;
+      try {
+        const detail = JSON.parse(event.data) as {
+          events: ApiInteractionEvent[];
+          latest_performance?: ApiPerformanceExchange | null;
+          performance_summary?: ApiPerformanceSummary | null;
+        };
+        setMessages(mapConversationEvents(detail.events));
+        if (detail.latest_performance) {
+          setLatestPerf(detail.latest_performance.metrics);
+          setPerfHistory((prev) => {
+            const withoutCurrent = prev.filter((item) => item.id !== detail.latest_performance?.id);
+            return [mapPerfExchange(detail.latest_performance), ...withoutCurrent].slice(0, 5);
+          });
+        }
+        if (detail.performance_summary) {
+          setPerformanceSummary(detail.performance_summary);
+        }
+        setCapabilityUpdates((prev) => {
+          const next = [...prev];
+          const latest = next[0];
+          const state = buildCapabilityMessage(detail.events, detail.latest_performance ?? null);
+          const payload = {
+            id: latest?.id ?? `stream-${activeConversationId}`,
+            capabilityName: "LLM",
+            status: state.status,
+            message: state.message,
+            timestamp: "Just now",
+            icon: <Bot className="w-4 h-4" style={{ color: "var(--aigent-color-primary)" }} />,
+          };
+          if (latest && latest.capabilityName === "LLM") {
+            next[0] = { ...latest, ...payload };
+            return next;
+          }
+          return [payload, ...next].slice(0, 20);
+        });
+      } catch {
+        // Ignore malformed SSE payloads.
+      }
+    });
+
+    source.onerror = () => {
+      // Browser auto-reconnect is enough for this lightweight baseline.
+    };
+
+    return () => {
+      source.close();
+      if (streamRef.current === source) {
+        streamRef.current = null;
+      }
+    };
+  }, [activeConversationId]);
 
   const handleSendMessage = async (content: string) => {
     if (isProcessing) return;
@@ -391,53 +597,21 @@ export default function App() {
       }
 
       const response = await api.sendMessage(content, conversationId);
-      const hasTelemetry = Boolean(response.performance);
-      const perf = response.performance ?? EMPTY_PERF;
-      setMessages((prev) => [
-        ...prev,
-        mapApiMessage(response.assistant_message),
-      ]);
-      setLatestPerf(perf);
-      setPerfHistory((prev) => [
-        {
-          id: `${response.assistant_message.id}-perf`,
-          conversationId: response.conversation_id,
-          timestamp: response.assistant_message.timestamp,
-          userPreview: ellipsize(content, 80),
-          assistantPreview: ellipsize(parseAssistantContent(response.assistant_message.content).visible, 80),
-          perf,
-        },
-        ...prev,
-      ].slice(0, 5));
-
       await refreshConversations(response.conversation_id);
-      const freshSummary = await api.getPerformanceSummary();
-      setPerformanceSummary(freshSummary);
+      setActiveConversationId(response.conversation_id);
 
       setCapabilityUpdates((prev) =>
         prev.map((u) =>
           u.id === pendingUpdateId
             ? {
                 ...u,
-                status: "success",
-                message: hasTelemetry
-                  ? (() => {
-                      const compaction = perf.context_compaction;
-                      if (compaction?.applied) {
-                        return `Done in ${formatMs(perf.total_latency_ms)} · Context compacted (${compaction.dropped_history_messages} old messages dropped)`;
-                      }
-                      return `Done in ${formatMs(perf.total_latency_ms)}`;
-                    })()
-                  : "Response generated (perf telemetry missing from backend)",
+                status: "processing",
+                message: "Queued for worker...",
                 timestamp: "Just now",
               }
             : u,
         ),
       );
-      if (!hasTelemetry && !telemetryMissingWarned) {
-        toast.warning("Perf telemetry missing in API response. Rebuild/restart kernel container.");
-        setTelemetryMissingWarned(true);
-      }
     } catch (error) {
       const msg = error instanceof Error ? error.message : "Failed to send message";
       setMessages((prev) => [
@@ -538,13 +712,16 @@ export default function App() {
         max_response_tokens: maxResponseTokens,
         compact_trigger_pct: compactPct,
         compact_instructions: contextSettingsDraft.compact_instructions,
+        memory_enabled: contextSettingsDraft.memory_enabled,
       });
       setContextSettings(updated);
       setContextSettingsDraft({
         max_response_tokens: String(updated.max_response_tokens),
         compact_trigger_pct: String(updated.compact_trigger_pct),
         compact_instructions: updated.compact_instructions || "",
+        memory_enabled: updated.memory_enabled,
       });
+      setMemoryEnabled(updated.memory_enabled);
       toast.success("Context settings saved");
     } catch (error) {
       const msg = error instanceof Error ? error.message : "Failed to save context settings";
@@ -566,6 +743,7 @@ export default function App() {
       setPerfHistory([]);
       setLatestPerf(EMPTY_PERF);
       setDebugLogs([]);
+      setMemoryChunks([]);
       setInputResetSignal((v) => v + 1);
       await loadDashboardData();
       toast.success("All local data deleted");
@@ -601,6 +779,31 @@ export default function App() {
       toast.success(`Backup exported: ${filename}`);
     } catch (error) {
       const msg = error instanceof Error ? error.message : "Failed to export backup";
+      toast.error(msg);
+    }
+  };
+
+  const handleReloadMemory = async () => {
+    setMemoryLoading(true);
+    try {
+      const result = await api.getMemoryChunks(200);
+      setMemoryChunks(result.chunks);
+      setMemoryEnabled(result.memory_enabled);
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : "Failed to load memory";
+      toast.error(msg);
+    } finally {
+      setMemoryLoading(false);
+    }
+  };
+
+  const handleDeleteMemoryChunk = async (chunkId: string) => {
+    try {
+      await api.deleteMemoryChunk(chunkId);
+      setMemoryChunks((prev) => prev.filter((chunk) => chunk.id !== chunkId));
+      toast.success("Memory chunk deleted");
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : "Failed to delete memory chunk";
       toast.error(msg);
     }
   };
@@ -666,7 +869,7 @@ export default function App() {
     return (
       <div className="p-4 rounded-lg mb-6" style={{ backgroundColor: "var(--aigent-color-surface)", border: "1px solid var(--aigent-color-border)" }}>
         <div className="text-sm mb-2" style={{ color: "var(--aigent-color-text)" }}>
-          Status: {baselineStatus.status} · {baselineStatus.completed_calls}/{baselineStatus.total_calls} calls ({pct}%)
+          Status: {baselineStatus.status} · {pct}%
         </div>
         <div className="w-full h-2 rounded" style={{ backgroundColor: "var(--aigent-color-bg)" }}>
           <div
@@ -700,28 +903,29 @@ export default function App() {
     lines.push(`- Model: ${result.model}`);
     lines.push(`- Completed: ${new Date(result.completed_at).toLocaleString()}`);
     lines.push(`- Duration: ${formatMs(result.duration_ms)}`);
-    lines.push(`- Total Calls: ${result.total_calls}`);
     lines.push("");
     for (const category of result.categories) {
       lines.push(`### ${category.label}`);
       lines.push("");
-      lines.push("| Case | Calls | Input Est | Min Latency | Max Latency | Avg Latency | Prompt Tok | Completion Tok | Total Tok |");
-      lines.push("|---|---:|---:|---:|---:|---:|---:|---:|---:|");
+      lines.push("| Case | User Input Est | Time to First Token | Time to Response Completion | Full Prompt Tokens | Completion Tokens | Total Tokens |");
+      lines.push("|---|---:|---:|---:|---:|---:|---:|");
       for (const c of category.cases) {
-        const minLatency = c.min_latency_ms ?? Math.round(c.avg_latency_ms);
-        const maxLatency = c.max_latency_ms ?? Math.round(c.avg_latency_ms);
+        const ttft = c.ttft_ms ?? c.min_latency_ms ?? Math.round(c.avg_latency_ms);
+        const completionTime = c.completion_time_ms ?? c.max_latency_ms ?? Math.round(c.avg_latency_ms);
         lines.push(
-          `| ${c.label} | ${c.calls} | ${c.input_tokens_est} | ${formatMs(minLatency)} | ${formatMs(maxLatency)} | ${formatMs(Math.round(c.avg_latency_ms))} | ${c.prompt_tokens} | ${c.completion_tokens} | ${c.total_tokens} |`,
+          `| ${c.label} | ${c.input_tokens_est} | ${formatMs(ttft)} | ${formatMs(completionTime)} | ${c.prompt_tokens} | ${c.completion_tokens} | ${c.total_tokens} |`,
         );
         if (c.per_turn_latency_ms && c.per_turn_latency_ms.length > 0) {
           lines.push("");
-          lines.push("| Turn | In Tok | Out Tok | Latency |");
-          lines.push("|---:|---:|---:|---:|");
+          lines.push("| Turn | In Tok | Out Tok | TTFT | Completion | Throughput |");
+          lines.push("|---:|---:|---:|---:|---:|---:|");
           for (let i = 0; i < c.per_turn_latency_ms.length; i += 1) {
             const inTok = c.per_turn_prompt_tokens?.[i] ?? Math.round(c.prompt_tokens / Math.max(1, c.calls));
             const outTok = c.per_turn_completion_tokens?.[i] ?? Math.round(c.completion_tokens / Math.max(1, c.calls));
-            const latency = c.per_turn_latency_ms[i];
-            lines.push(`| ${i + 1} | ${inTok} | ${outTok} | ${latency}ms |`);
+            const ttft = c.per_turn_ttft_ms?.[i] ?? c.per_turn_latency_ms[i];
+            const completion = c.per_turn_latency_ms[i];
+            const throughput = computeTokensPerSecond(outTok, completion);
+            lines.push(`| ${i + 1} | ${inTok} | ${outTok} | ${ttft}ms | ${completion}ms | ${throughput != null ? `${throughput.toFixed(1)} tok/s` : "-"} |`);
           }
         }
       }
@@ -825,6 +1029,23 @@ export default function App() {
   };
 
   const renderDashboardContent = () => {
+    const ttftValues = perfHistory
+      .map((item) => item.perf.ttft_ms)
+      .filter((value): value is number => typeof value === "number" && value > 0);
+    const avgTtftMs =
+      ttftValues.length > 0
+        ? Math.round(ttftValues.reduce((sum, value) => sum + value, 0) / ttftValues.length)
+        : latestPerf.ttft_ms ?? 0;
+    const throughputValues = perfHistory
+      .map((item) => computeTokensPerSecond(item.perf.completion_tokens, item.perf.llm_latency_ms))
+      .filter((value): value is number => typeof value === "number" && value > 0);
+    const avgThroughput =
+      throughputValues.length > 0
+        ? throughputValues.reduce((sum, value) => sum + value, 0) / throughputValues.length
+        : computeTokensPerSecond(latestPerf.completion_tokens, latestPerf.llm_latency_ms);
+    const minThroughput = throughputValues.length > 0 ? Math.min(...throughputValues) : null;
+    const maxThroughput = throughputValues.length > 0 ? Math.max(...throughputValues) : null;
+
     switch (dashboardSection) {
       case "performance":
         return (
@@ -842,14 +1063,14 @@ export default function App() {
                 <div className="p-6 rounded-lg" style={{ backgroundColor: "var(--aigent-color-surface)", border: "1px solid var(--aigent-color-border)" }}>
                   <div className="flex items-center gap-3 mb-4">
                     <Activity className="w-6 h-6" style={{ color: "var(--aigent-color-primary)" }} />
-                    <h3 className="m-0" style={{ color: "var(--aigent-color-text)" }}>Response Time</h3>
+                    <h3 className="m-0" style={{ color: "var(--aigent-color-text)" }}>Response Timing</h3>
                   </div>
                   <div className="text-3xl font-medium mb-2" style={{ color: "var(--aigent-color-text)" }}>Live</div>
                   <p className="text-sm" style={{ color: "var(--aigent-color-text-muted)" }}>
-                    Total {formatMs(latestPerf.total_latency_ms)} · LLM {formatMs(latestPerf.llm_latency_ms)}
+                    Average TTFT {formatMs(avgTtftMs)} · Average Throughput {avgThroughput != null ? `${avgThroughput.toFixed(1)} tok/s` : "-"}
                   </p>
                   <p className="text-xs mt-1" style={{ color: "var(--aigent-color-text-muted)" }}>
-                    Min {formatMs(performanceSummary?.latency_min_ms ?? 0)} · Max {formatMs(performanceSummary?.latency_max_ms ?? 0)} · Avg {formatMs(Math.round(performanceSummary?.latency_avg_ms ?? 0))}
+                    Historical throughput min {minThroughput != null ? `${minThroughput.toFixed(1)} tok/s` : "-"} · max {maxThroughput != null ? `${maxThroughput.toFixed(1)} tok/s` : "-"}
                   </p>
                 </div>
                 <div className="p-6 rounded-lg" style={{ backgroundColor: "var(--aigent-color-surface)", border: "1px solid var(--aigent-color-border)" }}>
@@ -895,18 +1116,75 @@ export default function App() {
                           <strong>A:</strong> {ellipsize(item.assistantPreview, 80)}
                         </div>
                         <div className="grid grid-cols-2 md:grid-cols-4 gap-2 text-xs" style={{ color: "var(--aigent-color-text-muted)" }}>
-                          <div>Total: {formatMs(item.perf.total_latency_ms)}</div>
-                          <div>LLM: {formatMs(item.perf.llm_latency_ms)}</div>
-                          <div>In tokens: {item.perf.prompt_tokens ?? "-"}</div>
-                          <div>Out tokens: {item.perf.completion_tokens ?? "-"}</div>
+                          <div>TTFT: {formatMs(item.perf.ttft_ms ?? 0)}</div>
+                          <div>Completion: {formatMs(item.perf.total_latency_ms)}</div>
+                          <div>Tokens/sec: {formatTokensPerSecond(item.perf.completion_tokens, item.perf.llm_latency_ms)}</div>
+                          <div>Full prompt tokens: {item.perf.prompt_tokens ?? "-"}</div>
+                          <div>Completion tokens: {item.perf.completion_tokens ?? "-"}</div>
+                          <div>Retrieved chunks: {item.perf.retrieved_chunk_count ?? 0}</div>
                           <div>System tokens est: {item.perf.prompt_breakdown.system_tokens_est ?? "-"}</div>
                           <div>User tokens est: {item.perf.prompt_breakdown.user_tokens_est ?? "-"}</div>
                           <div>Assistant tokens est: {item.perf.prompt_breakdown.assistant_tokens_est ?? "-"}</div>
                           <div>Total tokens: {item.perf.total_tokens ?? "-"}</div>
                         </div>
+                        {item.perf.retrieved_chunks && item.perf.retrieved_chunks.length > 0 && (
+                          <div className="mt-3 space-y-2">
+                            {item.perf.retrieved_chunks.map((chunk, idx) => (
+                              <div
+                                key={`${item.id}-chunk-${chunk.source_id}-${idx}`}
+                                className="p-3 rounded"
+                                style={{ backgroundColor: "var(--aigent-color-surface)", border: "1px solid var(--aigent-color-border)" }}
+                              >
+                                <div className="text-xs mb-1" style={{ color: "var(--aigent-color-text-muted)" }}>
+                                  Retrieved memory {idx + 1} · score {chunk.score.toFixed(3)} · {chunk.source_type} · source {chunk.source_id.slice(0, 8)}
+                                </div>
+                                <div className="text-xs mb-2" style={{ color: "var(--aigent-color-text-muted)" }}>
+                                  Source preview: {chunk.source_preview || "(none)"}
+                                </div>
+                                <div className="text-xs whitespace-pre-wrap break-words" style={{ color: "var(--aigent-color-text)" }}>
+                                  {chunk.content}
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        )}
                       </div>
                     ))}
                   </div>
+                )}
+              </div>
+              <div className="mt-6 p-6 rounded-lg" style={{ backgroundColor: "var(--aigent-color-surface)", border: "1px solid var(--aigent-color-border)" }}>
+                <div className="flex items-center gap-3 mb-4">
+                  <Brain className="w-6 h-6" style={{ color: "var(--aigent-color-primary)" }} />
+                  <h3 className="m-0" style={{ color: "var(--aigent-color-text)" }}>Retrieved Memory</h3>
+                </div>
+                <div className="text-sm mb-2" style={{ color: "var(--aigent-color-text-muted)" }}>
+                  Latest response used {latestPerf.retrieved_chunk_count ?? 0} memory chunk{(latestPerf.retrieved_chunk_count ?? 0) === 1 ? "" : "s"}.
+                </div>
+                {latestPerf.retrieved_chunks && latestPerf.retrieved_chunks.length > 0 ? (
+                  <div className="space-y-3">
+                    {latestPerf.retrieved_chunks.map((chunk, idx) => (
+                      <div
+                        key={`retrieved-${chunk.source_id}-${idx}`}
+                        className="p-4 rounded-lg"
+                        style={{ backgroundColor: "var(--aigent-color-bg)", border: "1px solid var(--aigent-color-border)" }}
+                      >
+                        <div className="text-xs mb-2" style={{ color: "var(--aigent-color-text-muted)" }}>
+                          Chunk {idx + 1} · score {chunk.score.toFixed(3)} · {chunk.source_type} · source {chunk.source_id.slice(0, 8)}
+                        </div>
+                        <div className="text-xs mb-2" style={{ color: "var(--aigent-color-text-muted)" }}>
+                          Source preview: {chunk.source_preview || "(none)"}
+                        </div>
+                        <div className="text-sm whitespace-pre-wrap break-words" style={{ color: "var(--aigent-color-text)" }}>
+                          {chunk.content}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <p className="text-sm" style={{ color: "var(--aigent-color-text-muted)" }}>
+                    No memory chunks were retrieved for the latest response.
+                  </p>
                 )}
               </div>
             </div>
@@ -930,6 +1208,124 @@ export default function App() {
                 <p className="text-sm" style={{ color: "var(--aigent-color-text-muted)" }}>
                   Backed by `/app/models-local/chat.db`
                 </p>
+              </div>
+            </div>
+          </div>
+        );
+      case "memory":
+        return (
+          <div className="h-full overflow-y-auto p-8">
+            <div className="max-w-7xl mx-auto">
+              <div className="mb-8 flex items-center justify-between">
+                <div>
+                  <h2 className="mb-2" style={{ color: "var(--aigent-color-text)" }}>Memory</h2>
+                  <p style={{ color: "var(--aigent-color-text-muted)" }}>
+                    Inspect and manage semantic memory chunks stored in `rag_chunks`.
+                  </p>
+                </div>
+                <button
+                  onClick={() => void handleReloadMemory()}
+                  disabled={memoryLoading}
+                  className="px-3 py-2 rounded-lg text-sm disabled:opacity-50"
+                  style={{ backgroundColor: "var(--aigent-color-surface)", border: "1px solid var(--aigent-color-border)", color: "var(--aigent-color-text)" }}
+                >
+                  {memoryLoading ? "Refreshing..." : "Refresh"}
+                </button>
+              </div>
+
+              <div className="p-6 rounded-lg mb-6" style={{ backgroundColor: "var(--aigent-color-surface)", border: "1px solid var(--aigent-color-border)" }}>
+                <div className="flex items-center gap-3 mb-4">
+                  <Brain className="w-6 h-6" style={{ color: "var(--aigent-color-primary)" }} />
+                  <h3 className="m-0" style={{ color: "var(--aigent-color-text)" }}>Memory Controls</h3>
+                </div>
+                <div
+                  className="p-4 rounded-lg mb-4 text-sm space-y-2"
+                  style={{ backgroundColor: "var(--aigent-color-bg)", border: "1px solid var(--aigent-color-border)", color: "var(--aigent-color-text-muted)" }}
+                >
+                  <div>
+                    Memory stores chunks from prior conversations and may retrieve them to influence future responses.
+                  </div>
+                  <div>
+                    It is not a verified knowledge base, permanent profile system, or guaranteed source of truth.
+                  </div>
+                  <div>
+                    Retrieved memory can help the model stay consistent across conversations, but it can also amplify earlier mistakes if incorrect assistant or user content is remembered and reused later.
+                  </div>
+                  <div>
+                    If memory starts steering responses in the wrong direction, you can turn it off or delete individual chunks below.
+                  </div>
+                  <div>
+                    To keep memory lightweight, older chunks are periodically rolled up into summarized memory when the store grows past its internal limit.
+                  </div>
+                </div>
+                <label className="inline-flex items-center gap-3 text-sm" style={{ color: "var(--aigent-color-text)" }}>
+                  <input
+                    type="checkbox"
+                    checked={contextSettingsDraft.memory_enabled}
+                    onChange={(e) =>
+                      setContextSettingsDraft((prev) => ({ ...prev, memory_enabled: e.target.checked }))
+                    }
+                  />
+                  Enable memory retrieval and memory writes
+                </label>
+                <div className="text-xs mt-2" style={{ color: "var(--aigent-color-text-muted)" }}>
+                  Current status: {memoryEnabled ? "On" : "Off"}.
+                </div>
+                <div className="text-xs mt-1" style={{ color: "var(--aigent-color-text-muted)" }}>
+                  Turning memory off stops new retrievals and stops writing new chunks. Existing chunks remain until deleted.
+                </div>
+                <button
+                  onClick={() => void handleSaveContextSettings()}
+                  className="px-3 py-1 rounded text-sm mt-4"
+                  style={{ backgroundColor: "var(--aigent-color-primary)", color: "#fff" }}
+                >
+                  Save Memory Setting
+                </button>
+              </div>
+
+              <div className="p-6 rounded-lg" style={{ backgroundColor: "var(--aigent-color-surface)", border: "1px solid var(--aigent-color-border)" }}>
+                <div className="flex items-center justify-between mb-4">
+                  <h3 className="m-0" style={{ color: "var(--aigent-color-text)" }}>
+                    Stored Chunks ({memoryChunks.length})
+                  </h3>
+                  <div className="text-xs" style={{ color: "var(--aigent-color-text-muted)" }}>
+                    Newest first
+                  </div>
+                </div>
+                {memoryChunks.length === 0 ? (
+                  <div className="text-sm" style={{ color: "var(--aigent-color-text-muted)" }}>
+                    No memory chunks stored yet.
+                  </div>
+                ) : (
+                  <div className="space-y-3">
+                    {memoryChunks.map((chunk) => (
+                      <div
+                        key={chunk.id}
+                        className="p-4 rounded-lg"
+                        style={{ backgroundColor: "var(--aigent-color-bg)", border: "1px solid var(--aigent-color-border)" }}
+                      >
+                        <div className="flex items-start justify-between gap-4">
+                          <div className="min-w-0 flex-1">
+                            <div className="text-xs mb-2" style={{ color: "var(--aigent-color-text-muted)" }}>
+                              {chunk.source_type} · source {chunk.source_id.slice(0, 8)} · {chunk.content_tokens_est} tok est · {chunk.embedding_dimensions} dims · {new Date(chunk.created_at).toLocaleString()}
+                            </div>
+                            <div className="text-sm whitespace-pre-wrap break-words" style={{ color: "var(--aigent-color-text)" }}>
+                              {chunk.content}
+                            </div>
+                          </div>
+                          <button
+                            onClick={() => void handleDeleteMemoryChunk(chunk.id)}
+                            className="px-3 py-2 rounded-lg text-sm flex items-center gap-2"
+                            style={{ backgroundColor: "rgba(239, 68, 68, 0.12)", border: "1px solid rgba(239, 68, 68, 0.25)", color: "rgb(220, 38, 38)" }}
+                          >
+                            <Trash2 className="w-4 h-4" />
+                            Delete
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
               </div>
             </div>
           </div>
@@ -981,7 +1377,7 @@ export default function App() {
                   <li>Simple Q/A: 100, 250, 500 user tokens</li>
                   <li>Summarization: 200, 500, 1000, 2000 user tokens</li>
                   <li>Multi-turn: 20 turns, 50-200 user tokens per turn</li>
-                  <li>System Prompt Pressure: 200, 500, 1000, 2000, 5000, 10000 system tokens + 100-300 user tokens</li>
+                  <li>System Prompt Pressure: ~200, ~500, ~1000, ~2000, ~5000, ~10000 target system tokens + estimated 100-300 user tokens</li>
                   <li>Extra: structured extraction reliability check</li>
                 </ul>
               </div>
@@ -997,15 +1393,31 @@ export default function App() {
                 </div>
               ) : (
                 <div className="space-y-4">
+                  {(() => {
+                    const summary = summarizeBaseline(baselineResult);
+                    return (
+                      <div className="p-4 rounded-lg" style={{ backgroundColor: "var(--aigent-color-surface)", border: "1px solid var(--aigent-color-border)" }}>
+                        <div className="text-sm" style={{ color: "var(--aigent-color-text)" }}>
+                          Average TTFT {summary.avgTtftMs != null ? formatMs(summary.avgTtftMs) : "-"} · Average Throughput {summary.avgThroughput != null ? `${summary.avgThroughput.toFixed(1)} tok/s` : "-"}
+                        </div>
+                        <div className="text-xs mt-1" style={{ color: "var(--aigent-color-text-muted)" }}>
+                          Historical completion TTFT min {summary.minTtftMs != null ? formatMs(summary.minTtftMs) : "-"} · max {summary.maxTtftMs != null ? formatMs(summary.maxTtftMs) : "-"}
+                        </div>
+                        <div className="text-xs mt-1" style={{ color: "var(--aigent-color-text-muted)" }}>
+                          Historical completion throughput min {summary.minThroughput != null ? `${summary.minThroughput.toFixed(1)} tok/s` : "-"} · max {summary.maxThroughput != null ? `${summary.maxThroughput.toFixed(1)} tok/s` : "-"}
+                        </div>
+                      </div>
+                    );
+                  })()}
                   <div className="p-4 rounded-lg" style={{ backgroundColor: "var(--aigent-color-surface)", border: "1px solid var(--aigent-color-border)" }}>
                     <div className="text-sm" style={{ color: "var(--aigent-color-text)" }}>
                       Model: {baselineResult.model}
                     </div>
                     <div className="text-xs mt-1" style={{ color: "var(--aigent-color-text-muted)" }}>
-                      Duration: {formatMs(baselineResult.duration_ms)} · Calls: {baselineResult.total_calls} · Completed: {new Date(baselineResult.completed_at).toLocaleString()}
+                      Duration: {formatMs(baselineResult.duration_ms)} · Completed: {new Date(baselineResult.completed_at).toLocaleString()}
                     </div>
                     <div className="text-xs mt-1" style={{ color: "var(--aigent-color-text-muted)" }}>
-                      Note: Multi-turn latency reports min/max/avg across turns.
+                      Note: "User Input Est" is only the synthetic user payload estimate. "Full Prompt Tokens" is the actual model-reported total prompt size.
                     </div>
                   </div>
                   {baselineResult.categories.map((category) => (
@@ -1015,16 +1427,17 @@ export default function App() {
                         {category.cases.map((c) => (
                           <div key={c.id} className="p-3 rounded" style={{ backgroundColor: "var(--aigent-color-bg)", border: "1px solid var(--aigent-color-border)" }}>
                             <div className="text-sm mb-1" style={{ color: "var(--aigent-color-text)" }}>{c.label}</div>
-                            <div className="grid grid-cols-2 md:grid-cols-4 gap-2 text-xs" style={{ color: "var(--aigent-color-text-muted)" }}>
-                              <div>Calls: {c.calls}</div>
-                              <div>Input est: {c.input_tokens_est}</div>
-                              <div>Min latency: {formatMs(c.min_latency_ms ?? Math.round(c.avg_latency_ms))}</div>
-                              <div>Max latency: {formatMs(c.max_latency_ms ?? Math.round(c.avg_latency_ms))}</div>
-                              <div>Avg latency: {formatMs(Math.round(c.avg_latency_ms))}</div>
-                              <div>Prompt tokens: {c.prompt_tokens}</div>
-                              <div>Completion tokens: {c.completion_tokens}</div>
-                              <div>Total tokens: {c.total_tokens}</div>
-                            </div>
+                            {(!c.per_turn_latency_ms || c.per_turn_latency_ms.length === 0) && (
+                              <div className="grid grid-cols-2 md:grid-cols-4 gap-2 text-xs" style={{ color: "var(--aigent-color-text-muted)" }}>
+                                <div>User input est: {c.input_tokens_est}</div>
+                                <div>Time to first token: {formatMs(c.ttft_ms ?? c.min_latency_ms ?? Math.round(c.avg_latency_ms))}</div>
+                                <div>Time to response completion: {formatMs(c.completion_time_ms ?? c.max_latency_ms ?? Math.round(c.avg_latency_ms))}</div>
+                                <div>Throughput: {formatTokensPerSecond(c.completion_tokens, c.completion_time_ms ?? c.total_latency_ms)}</div>
+                                <div>Full prompt tokens: {c.prompt_tokens}</div>
+                                <div>Completion tokens: {c.completion_tokens}</div>
+                                <div>Total tokens: {c.total_tokens}</div>
+                              </div>
+                            )}
                             {c.per_turn_latency_ms && c.per_turn_latency_ms.length > 0 && (
                               <div className="mt-3 overflow-x-auto">
                                 <table className="w-full text-xs" style={{ color: "var(--aigent-color-text-muted)" }}>
@@ -1033,7 +1446,9 @@ export default function App() {
                                       <th className="text-left py-1">Turn</th>
                                       <th className="text-left py-1">In tokens</th>
                                       <th className="text-left py-1">Out tokens</th>
-                                      <th className="text-left py-1">Latency</th>
+                                      <th className="text-left py-1">TTFT</th>
+                                      <th className="text-left py-1">Completion</th>
+                                      <th className="text-left py-1">Throughput</th>
                                     </tr>
                                   </thead>
                                   <tbody>
@@ -1042,7 +1457,9 @@ export default function App() {
                                         <td className="py-1">{idx + 1}</td>
                                         <td className="py-1">{c.per_turn_prompt_tokens?.[idx] ?? Math.round(c.prompt_tokens / Math.max(1, c.calls))}</td>
                                         <td className="py-1">{c.per_turn_completion_tokens?.[idx] ?? Math.round(c.completion_tokens / Math.max(1, c.calls))}</td>
+                                        <td className="py-1">{formatMs(c.per_turn_ttft_ms?.[idx] ?? ms)}</td>
                                         <td className="py-1">{formatMs(ms)}</td>
+                                        <td className="py-1">{formatTokensPerSecond(c.per_turn_completion_tokens?.[idx] ?? null, ms)}</td>
                                       </tr>
                                     ))}
                                   </tbody>
@@ -1231,6 +1648,16 @@ export default function App() {
                       style={{ backgroundColor: "var(--aigent-color-bg)", border: "1px solid var(--aigent-color-border)", color: "var(--aigent-color-text)" }}
                     />
                   </label>
+                  <label className="text-sm flex items-center gap-2 md:col-span-2" style={{ color: "var(--aigent-color-text-muted)" }}>
+                    <input
+                      type="checkbox"
+                      checked={contextSettingsDraft.memory_enabled}
+                      onChange={(e) =>
+                        setContextSettingsDraft((prev) => ({ ...prev, memory_enabled: e.target.checked }))
+                      }
+                    />
+                    Enable memory retrieval and memory writes
+                  </label>
                 </div>
                 <label className="text-sm" style={{ color: "var(--aigent-color-text-muted)" }}>
                   Special compact context instructions
@@ -1245,7 +1672,7 @@ export default function App() {
                   />
                 </label>
                 <div className="text-xs mt-2" style={{ color: "var(--aigent-color-text-muted)" }}>
-                  Current: {contextSettings?.max_context_tokens ?? 4096} context tokens · {contextSettings?.max_response_tokens ?? 512} response tokens · trigger {(contextSettings?.compact_trigger_pct ?? 0.9) * 100}%
+                  Current: {contextSettings?.max_context_tokens ?? 4096} context tokens · {contextSettings?.max_response_tokens ?? 512} response tokens · trigger {(contextSettings?.compact_trigger_pct ?? 0.9) * 100}% · memory {contextSettings?.memory_enabled ? "on" : "off"}
                 </div>
                 <div className="text-xs mt-1" style={{ color: "var(--aigent-color-text-muted)" }}>
                   Verification: Agent Updates will show "Context compacted" when compaction is applied.

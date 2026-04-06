@@ -9,6 +9,19 @@ export interface ApiMessage {
   timestamp: string;
 }
 
+export interface ApiInteractionEvent {
+  id: string;
+  conversation_id: string;
+  role: MessageRole;
+  event_type: string;
+  content: string;
+  status: "pending" | "processing" | "completed" | "failed";
+  timestamp: string;
+  processed_at: string | null;
+  error: string | null;
+  causation_event_id: string | null;
+}
+
 export interface ApiConversationSummary {
   id: string;
   title: string;
@@ -24,11 +37,17 @@ export interface ApiConversationDetail {
   messages: ApiMessage[];
 }
 
-export interface ApiChatResponse {
+export interface ApiConversationEventsResponse {
+  id: string;
+  title: string;
+  updated_at: string;
+  events: ApiInteractionEvent[];
+}
+
+export interface ApiChatAcceptedResponse {
   conversation_id: string;
-  user_message: ApiMessage;
-  assistant_message: ApiMessage;
-  performance?: ApiPerformanceMetrics;
+  event_id: string;
+  accepted_at: string;
 }
 
 export interface ApiPromptBreakdown {
@@ -43,9 +62,12 @@ export interface ApiPromptBreakdown {
 export interface ApiPerformanceMetrics {
   total_latency_ms: number;
   llm_latency_ms: number;
+  ttft_ms: number | null;
   prompt_tokens: number | null;
   completion_tokens: number | null;
   total_tokens: number | null;
+  retrieved_chunk_count: number;
+  retrieved_chunks: ApiRetrievedChunk[];
   prompt_breakdown: ApiPromptBreakdown;
   context_compaction?: {
     applied: boolean;
@@ -54,6 +76,14 @@ export interface ApiPerformanceMetrics {
     estimated_prompt_tokens_after: number;
     dropped_history_messages: number;
   } | null;
+}
+
+export interface ApiRetrievedChunk {
+  content: string;
+  score: number;
+  source_id: string;
+  source_type: string;
+  source_preview: string;
 }
 
 export interface ApiPerformanceExchange {
@@ -124,7 +154,23 @@ export interface ApiContextSettings {
   max_response_tokens: number;
   compact_trigger_pct: number;
   compact_instructions: string;
+  memory_enabled: boolean;
   updated_at: string;
+}
+
+export interface ApiMemoryChunk {
+  id: string;
+  source_type: string;
+  source_id: string;
+  content: string;
+  created_at: string;
+  embedding_dimensions: number;
+  content_tokens_est: number;
+}
+
+export interface ApiMemoryChunkListResponse {
+  memory_enabled: boolean;
+  chunks: ApiMemoryChunk[];
 }
 
 export interface ApiWarmupResponse {
@@ -140,6 +186,7 @@ export interface ApiBaselineCaseResult {
   label: string;
   calls: number;
   input_tokens_est: number;
+  ttft_ms?: number | null;
   prompt_tokens: number;
   completion_tokens: number;
   total_tokens: number;
@@ -147,7 +194,9 @@ export interface ApiBaselineCaseResult {
   avg_latency_ms: number;
   min_latency_ms?: number | null;
   max_latency_ms?: number | null;
+  completion_time_ms?: number | null;
   per_turn_latency_ms?: number[] | null;
+  per_turn_ttft_ms?: number[] | null;
   per_turn_prompt_tokens?: number[] | null;
   per_turn_completion_tokens?: number[] | null;
 }
@@ -226,7 +275,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
 export const api = {
   async healthCheck() {
-    return request<{ status: "ok"; tenant_id: string; model: string; ollama_base_url: string; is_warm: boolean }>("/health");
+    return request<{ status: "ok"; tenant_id: string; model: string; ollama_base_url: string; embedding_base_url: string; is_warm: boolean }>("/health");
   },
 
   async listConversations() {
@@ -237,6 +286,14 @@ export const api = {
     return request<ApiConversationDetail>(`/api/conversations/${conversationId}`);
   },
 
+  async getConversationEvents(conversationId: string) {
+    return request<ApiConversationEventsResponse>(`/api/conversations/${conversationId}/events`);
+  },
+
+  conversationStreamUrl(conversationId: string) {
+    return `${API_BASE_URL}/api/conversations/${conversationId}/stream`;
+  },
+
   async createConversation(title?: string) {
     return request<ApiConversationDetail>("/api/conversations", {
       method: "POST",
@@ -245,7 +302,7 @@ export const api = {
   },
 
   async sendMessage(message: string, conversationId?: string) {
-    return request<ApiChatResponse>("/api/chat", {
+    return request<ApiChatAcceptedResponse>("/api/chat", {
       method: "POST",
       body: JSON.stringify({
         message,
@@ -320,10 +377,21 @@ export const api = {
     max_response_tokens?: number;
     compact_trigger_pct?: number;
     compact_instructions?: string;
+    memory_enabled?: boolean;
   }) {
     return request<ApiContextSettings>("/api/prompts/context-settings", {
       method: "PATCH",
       body: JSON.stringify(payload),
+    });
+  },
+
+  async getMemoryChunks(limit = 200) {
+    return request<ApiMemoryChunkListResponse>(`/api/memory/chunks?limit=${limit}`);
+  },
+
+  async deleteMemoryChunk(chunkId: string) {
+    await request<null>(`/api/memory/chunks/${chunkId}`, {
+      method: "DELETE",
     });
   },
 
