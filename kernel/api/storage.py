@@ -21,6 +21,7 @@ def _utc_now_iso() -> str:
 
 
 def _utc_from_iso(value: str) -> datetime:
+    value = value.replace("\x00", "").strip()
     if value.endswith("Z"):
         value = value.replace("Z", "+00:00")
     return datetime.fromisoformat(value)
@@ -127,7 +128,13 @@ class ChatStore:
         self._db_path = db_path
         os.makedirs(os.path.dirname(db_path), exist_ok=True)
         self._conn = self._create_connection()
-        self._init_db()
+        try:
+            self._init_db()
+            self._repair_db_if_needed()
+        except sqlite3.DatabaseError:
+            self._rebuild_database_file()
+            self._conn = self._create_connection()
+            self._init_db()
 
     def _create_connection(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self._db_path, timeout=30, isolation_level=None)
@@ -140,6 +147,21 @@ class ChatStore:
     @property
     def conn(self) -> sqlite3.Connection:
         return self._conn
+
+    def _rebuild_database_file(self) -> None:
+        try:
+            self._conn.close()
+        except Exception:
+            pass
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        corrupt_path = f"{self._db_path}.corrupt-{timestamp}"
+        if os.path.exists(self._db_path):
+            os.replace(self._db_path, corrupt_path)
+        wal_path = f"{self._db_path}-wal"
+        shm_path = f"{self._db_path}-shm"
+        for path in (wal_path, shm_path):
+            if os.path.exists(path):
+                os.remove(path)
 
     def _init_db(self) -> None:
         with self._conn as conn:
@@ -285,6 +307,38 @@ class ChatStore:
                 conn.execute(
                     "ALTER TABLE prompt_context_settings ADD COLUMN memory_enabled INTEGER NOT NULL DEFAULT 1"
                 )
+
+    def _delete_rows_with_null_bytes(self, table: str, columns: list[str]) -> int:
+        predicates = [f"substr(hex(COALESCE({column}, '')), 1, 2) = '00'" for column in columns]
+        if not predicates:
+            return 0
+        query = f"DELETE FROM {table} WHERE " + " OR ".join(predicates)
+        cursor = self._conn.execute(query)
+        return int(cursor.rowcount or 0)
+
+    def _repair_db_if_needed(self) -> None:
+        try:
+            integrity = self._conn.execute("PRAGMA integrity_check").fetchone()
+            integrity_status = str(integrity[0]) if integrity is not None else "ok"
+        except sqlite3.DatabaseError:
+            integrity_status = "error"
+        deleted = 0
+        deleted += self._delete_rows_with_null_bytes(
+            "interaction_events",
+            ["status", "created_at", "processed_at", "causation_event_id"],
+        )
+        deleted += self._delete_rows_with_null_bytes(
+            "conversations",
+            ["created_at", "updated_at"],
+        )
+        deleted += self._delete_rows_with_null_bytes(
+            "performance_exchanges",
+            ["created_at", "user_event_id", "assistant_event_id"],
+        )
+        if integrity_status != "ok" or deleted > 0:
+            self._conn.execute("REINDEX")
+            self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            self._conn.execute("VACUUM")
 
     def create_conversation(self, title: str | None = None) -> tuple[str, datetime]:
         conversation_id = str(uuid.uuid4())
@@ -1133,7 +1187,9 @@ class ChatStore:
             conn.execute("UPDATE prompt_profiles SET updated_at = ? WHERE id = ?", (now, profile_id))
 
     def delete_all_data(self) -> None:
-        with self._conn as conn:
+        conn = self._conn
+        conn.execute("BEGIN IMMEDIATE")
+        try:
             conn.execute("DELETE FROM performance_exchanges")
             conn.execute("DELETE FROM rag_chunks")
             conn.execute("DELETE FROM interaction_events")
@@ -1141,6 +1197,13 @@ class ChatStore:
             conn.execute("DELETE FROM prompt_component_overrides")
             conn.execute("DELETE FROM prompt_profiles")
             conn.execute("DELETE FROM prompt_context_settings")
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        conn.execute("REINDEX")
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        conn.execute("VACUUM")
 
     def export_all_data(self, tenant_id: str) -> dict:
         with self._conn as conn:

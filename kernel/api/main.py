@@ -142,7 +142,7 @@ def _window_stats(window: tuple[int, int, int, int]) -> TokenWindowStats:
 
 app = FastAPI(
     title="AIgentOS Kernel API",
-    version="0.2.3-oss",
+    version="0.2.4-oss",
     description="Minimal OSS chat API wired to Ollama",
 )
 
@@ -941,7 +941,7 @@ async def _execute_baseline(job_id: str, enforce_max_response_tokens: bool, mode
     system_prompt_targets = [200, 500, 1000, 2000, 5000, 10000]
     system_prompt_cases: list[BaselineCaseResult] = []
     if mode == "end_to_end_aigentos":
-        _append_baseline_event(job_id, "System Prompt Pressure uses direct model mode in 0.2.3-oss")
+        _append_baseline_event(job_id, "System Prompt Pressure uses direct model mode in 0.2.4-oss")
     for idx, target in enumerate(system_prompt_targets):
         user_tokens = 100 + ((idx * 37) % 201)
         system_prompt_cases.append(

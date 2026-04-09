@@ -33,7 +33,7 @@ This repository currently ships:
 - Performance/debug API surfaces with TTFT tracking, token breakdowns, and baseline benchmarking
 - A Vite/React WebUI (`/agent-webui`) as an optional interface
 
-Current release line: `v0.2.3-oss`
+Current release line: `v0.2.4-oss`
 
 ## Why One Repo (for now)
 
@@ -133,9 +133,13 @@ Benchmark environment:
 - 18 GB RAM
 - macOS Tahoe 26.3
 
-### v0.2.3-oss End-to-End Baseline (2026-04-08)
+### v0.2.4-oss SQLite Hardening + End-to-End Baseline (2026-04-08)
 
-v0.2.3-oss adds a baseline mode toggle:
+v0.2.4-oss includes:
+- stronger SQLite reset and recovery behavior for the local chat store
+- the direct-vs-E2E baseline split introduced in `v0.2.3-oss`
+
+The baseline mode toggle provides:
 - **Direct model**: benchmarks the raw prompt → LLM → response path (what v0.2.0 and v0.1.0 measured)
 - **End-to-end AIgentOS**: benchmarks the real product path — `POST /api/chat` → async dialogue worker → assistant event completion — the same flow a user experiences when sending a message
 
@@ -187,7 +191,7 @@ Observed Direct model ranges:
 
 ### Comparison Notes
 
-**E2E vs Direct model (v0.2.3-oss)**:
+**E2E vs Direct model (v0.2.4-oss)**:
 - **TTFT overhead**: First-turn TTFT in E2E mode is `2.1s-5.9s` vs `295ms-350ms` in Direct mode. The ~2s floor reflects the async worker poll cycle + event persistence + SSE delivery path that real user messages travel through. At high context sizes (~10k system tokens) the gap narrows because LLM prefill dominates (`~12.3s` E2E vs `~12.2s` Direct).
 - **20-turn throughput**: E2E shows `3.9-27.4 tok/s` vs Direct's `43-55 tok/s`. The lower E2E throughput reflects per-token DB writes (the worker updates the assistant event on each streamed chunk for real-time SSE) and polling overhead. The wider range in E2E includes occasional outlier turns with spikes up to `17s` that don't appear in Direct runs.
 - **Summarization**: E2E `3.77s-13.80s` vs Direct `2.30s-5.28s`. The wider E2E ceiling comes from the worker overhead on longer completions.
@@ -207,7 +211,7 @@ Observed Direct model ranges:
 - When a model emits visible thinking text, baseline `completion tokens` reflect the model's full generated output budget, which can include both `<think>...</think>` content and the final visible answer.
 - The baseline `Enforce max response tokens` option uses the current runtime `max_response_tokens` setting. If that cap is increased, baseline completion lengths and latencies may increase too.
 - **Direct model** baselines (v0.1.0, v0.2.0) measure raw LLM performance — the prompt is sent directly to the model and the response is timed. This isolates model behavior from system overhead.
-- **End-to-end AIgentOS** baselines (v0.2.3-oss) measure the real product path that a user experiences: message enqueue, async worker pickup, DB event creation, streamed token persistence, and SSE delivery. This is the more honest benchmark for evaluating actual user-facing latency on this branch.
+- **End-to-end AIgentOS** baselines (v0.2.4-oss) measure the real product path that a user experiences: message enqueue, async worker pickup, DB event creation, streamed token persistence, and SSE delivery. This is the more honest benchmark for evaluating actual user-facing latency on this branch.
 
 ### General Perf Dashboard (for chats)
 ![AIgentOS Perf Dashboard](baseline/ui/performance.png)

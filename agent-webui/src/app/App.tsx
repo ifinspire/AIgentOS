@@ -1443,7 +1443,7 @@ export default function App() {
                     </div>
                     {baselineResult.mode === "end_to_end_aigentos" && (
                       <div className="text-xs mt-1" style={{ color: "var(--aigent-color-text-muted)" }}>
-                        E2E mode measures the real async AIgentOS path. System Prompt Pressure remains a direct-model synthetic stress test in 0.2.3-oss.
+                        E2E mode measures the real async AIgentOS path. System Prompt Pressure remains a direct-model synthetic stress test in 0.2.4-oss.
                       </div>
                     )}
                   </div>

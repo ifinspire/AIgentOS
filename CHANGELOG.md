@@ -2,15 +2,23 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.2.4-oss] - 2026-04-08
+
+### Fixed — SQLite Reset and Recovery Hardening
+- `_utc_from_iso()` now strips null bytes defensively before timestamp parsing.
+- `delete_all_data()` now performs a stronger reset with an explicit transaction, `REINDEX`, WAL checkpoint truncation, and `VACUUM`.
+- Startup now performs a lightweight DB repair pass for malformed null-byte rows.
+- If SQLite is already malformed on startup, `AIgentOS-GH` now archives the broken DB and recreates a fresh clean store automatically.
+
+### Changed — Version Labels
+- Product/version labels updated to `v0.2.4-oss` across the kernel metadata, WebUI, package metadata, and docs.
+
 ## [0.2.3-oss] - 2026-04-08
 
 ### Added — Direct vs E2E Baseline Modes
 - Baseline runs now support `Direct model` and `End-to-end AIgentOS` modes.
 - E2E mode measures the real async `POST /api/chat -> dialogue-worker -> assistant completion` path for `AIgentOS-GH`.
 - Baseline markdown exports now include mode metadata, and E2E exports use a `baseline-e2e-...` filename.
-
-### Changed — Version Labels
-- Product/version labels updated to `v0.2.3-oss` across the kernel metadata, WebUI, and package metadata.
 
 ## [0.2.0-oss] - 2026-04-06
 

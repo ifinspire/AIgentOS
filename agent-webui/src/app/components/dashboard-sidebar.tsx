@@ -111,7 +111,7 @@ export function DashboardSidebar({
           </div>
           <div className="flex justify-between">
             <span>Version</span>
-            <span className="font-medium" style={{ color: 'var(--aigent-color-text)' }}>v0.2.3-oss</span>
+            <span className="font-medium" style={{ color: 'var(--aigent-color-text)' }}>v0.2.4-oss</span>
           </div>
         </div>
       </div>
