@@ -266,6 +266,7 @@ class BaselineCategoryResult(BaseModel):
 
 class BaselineRunResponse(BaseModel):
     model: str
+    mode: Literal["direct_model", "end_to_end_aigentos"]
     started_at: datetime
     completed_at: datetime
     duration_ms: int
@@ -280,6 +281,7 @@ class BaselineJobStartResponse(BaseModel):
 
 class BaselineStartRequest(BaseModel):
     enforce_max_response_tokens: bool = True
+    mode: Literal["direct_model", "end_to_end_aigentos"] = "direct_model"
 
 
 class BaselineJobStatusResponse(BaseModel):

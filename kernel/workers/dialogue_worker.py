@@ -258,6 +258,8 @@ async def _process_event(event: StoredInteractionEvent) -> None:
     )
     store.add_performance_exchange(
         conversation_id=event.conversation_id,
+        user_event_id=event.id,
+        assistant_event_id=assistant_event.id,
         user_preview=event.content.strip()[:160],
         assistant_preview=completion.content.strip()[:160],
         total_latency_ms=total_latency_ms,

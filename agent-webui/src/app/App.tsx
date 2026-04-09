@@ -347,6 +347,7 @@ export default function App() {
   const [baselineStatus, setBaselineStatus] = useState<ApiBaselineJobStatusResponse | null>(null);
   const [baselineJobId, setBaselineJobId] = useState<string | null>(null);
   const [baselineEnforceMaxResponseTokens, setBaselineEnforceMaxResponseTokens] = useState(true);
+  const [baselineMode, setBaselineMode] = useState<"direct_model" | "end_to_end_aigentos">("direct_model");
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
   const streamRef = useRef<EventSource | null>(null);
 
@@ -816,6 +817,7 @@ export default function App() {
     try {
       const started = await api.startBaseline({
         enforce_max_response_tokens: baselineEnforceMaxResponseTokens,
+        mode: baselineMode,
       });
       setBaselineJobId(started.job_id);
       toast.success("Baseline started");
@@ -901,8 +903,12 @@ export default function App() {
     lines.push("## Baseline Results");
     lines.push("");
     lines.push(`- Model: ${result.model}`);
+    lines.push(`- Mode: ${result.mode === "end_to_end_aigentos" ? "End-to-end AIgentOS" : "Direct model"}`);
     lines.push(`- Completed: ${new Date(result.completed_at).toLocaleString()}`);
     lines.push(`- Duration: ${formatMs(result.duration_ms)}`);
+    if (result.mode === "end_to_end_aigentos") {
+      lines.push(`- Note: E2E mode measures the real async AIgentOS path (chat enqueue -> worker -> assistant completion).`);
+    }
     lines.push("");
     for (const category of result.categories) {
       lines.push(`### ${category.label}`);
@@ -949,7 +955,7 @@ export default function App() {
       String(now.getMinutes()).padStart(2, "0"),
       String(now.getSeconds()).padStart(2, "0"),
     ].join("");
-    const filename = `baseline-${stamp}.md`;
+    const filename = `${baselineResult.mode === "end_to_end_aigentos" ? "baseline-e2e" : "baseline"}-${stamp}.md`;
     const blob = new Blob([buildBaselineMarkdown(baselineResult)], { type: "text/markdown" });
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
@@ -1343,6 +1349,19 @@ export default function App() {
                 </div>
                 <div className="flex items-center gap-2">
                   <label className="text-sm flex items-center gap-2 mr-2" style={{ color: "var(--aigent-color-text-muted)" }}>
+                    Mode
+                    <select
+                      value={baselineMode}
+                      disabled={baselineRunning}
+                      onChange={(e) => setBaselineMode(e.target.value as "direct_model" | "end_to_end_aigentos")}
+                      className="px-2 py-1 rounded"
+                      style={{ backgroundColor: "var(--aigent-color-surface)", color: "var(--aigent-color-text)", border: "1px solid var(--aigent-color-border)" }}
+                    >
+                      <option value="direct_model">Direct model</option>
+                      <option value="end_to_end_aigentos">End-to-end AIgentOS</option>
+                    </select>
+                  </label>
+                  <label className="text-sm flex items-center gap-2 mr-2" style={{ color: "var(--aigent-color-text-muted)" }}>
                     <input
                       type="checkbox"
                       checked={baselineEnforceMaxResponseTokens}
@@ -1372,6 +1391,9 @@ export default function App() {
               <div className="p-4 rounded-lg mb-6" style={{ backgroundColor: "var(--aigent-color-surface)", border: "1px solid var(--aigent-color-border)" }}>
                 <div className="text-sm" style={{ color: "var(--aigent-color-text)" }}>
                   Includes:
+                </div>
+                <div className="text-xs mt-2" style={{ color: "var(--aigent-color-text-muted)" }}>
+                  Mode: {baselineMode === "end_to_end_aigentos" ? "End-to-end AIgentOS (real async worker path)" : "Direct model (raw prompt/model path)"}
                 </div>
                 <ul className="text-sm mt-2 space-y-1" style={{ color: "var(--aigent-color-text-muted)" }}>
                   <li>Simple Q/A: 100, 250, 500 user tokens</li>
@@ -1414,11 +1436,16 @@ export default function App() {
                       Model: {baselineResult.model}
                     </div>
                     <div className="text-xs mt-1" style={{ color: "var(--aigent-color-text-muted)" }}>
-                      Duration: {formatMs(baselineResult.duration_ms)} · Completed: {new Date(baselineResult.completed_at).toLocaleString()}
+                      Mode: {baselineResult.mode === "end_to_end_aigentos" ? "End-to-end AIgentOS" : "Direct model"} · Duration: {formatMs(baselineResult.duration_ms)} · Completed: {new Date(baselineResult.completed_at).toLocaleString()}
                     </div>
                     <div className="text-xs mt-1" style={{ color: "var(--aigent-color-text-muted)" }}>
                       Note: "User Input Est" is only the synthetic user payload estimate. "Full Prompt Tokens" is the actual model-reported total prompt size.
                     </div>
+                    {baselineResult.mode === "end_to_end_aigentos" && (
+                      <div className="text-xs mt-1" style={{ color: "var(--aigent-color-text-muted)" }}>
+                        E2E mode measures the real async AIgentOS path. System Prompt Pressure remains a direct-model synthetic stress test in 0.2.3-oss.
+                      </div>
+                    )}
                   </div>
                   {baselineResult.categories.map((category) => (
                     <div key={category.id} className="p-4 rounded-lg" style={{ backgroundColor: "var(--aigent-color-surface)", border: "1px solid var(--aigent-color-border)" }}>

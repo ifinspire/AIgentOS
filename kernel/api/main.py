@@ -142,7 +142,7 @@ def _window_stats(window: tuple[int, int, int, int]) -> TokenWindowStats:
 
 app = FastAPI(
     title="AIgentOS Kernel API",
-    version="0.2.0",
+    version="0.2.3-oss",
     description="Minimal OSS chat API wired to Ollama",
 )
 
@@ -396,6 +396,62 @@ def _build_system_payload(target_tokens: int, seed: str) -> str:
     return text
 
 
+def _enqueue_chat_message(conversation_id: str, message: str) -> StoredInteractionEvent:
+    user_event = store.create_interaction_event(
+        conversation_id=conversation_id,
+        role="user",
+        content=message,
+        status="pending",
+    )
+    store.maybe_set_title_from_message(conversation_id, message)
+    return user_event
+
+
+async def _await_end_to_end_turn(
+    conversation_id: str,
+    user_event_id: str,
+    timeout_s: float = 120.0,
+) -> tuple[int | None, int]:
+    started = time.perf_counter()
+    ttft_ms: int | None = None
+    while time.perf_counter() - started < timeout_s:
+        events = store.get_conversation_events(conversation_id)
+        assistant_event = next(
+            (
+                event
+                for event in events
+                if event.role == "assistant" and event.causation_event_id == user_event_id
+            ),
+            None,
+        )
+        if assistant_event is not None:
+            if ttft_ms is None:
+                visible_text = extract_visible_text(assistant_event.content).strip()
+                if visible_text:
+                    ttft_ms = int((time.perf_counter() - started) * 1000)
+            if assistant_event.status == "failed":
+                raise RuntimeError(assistant_event.error or f"Assistant event {assistant_event.id} failed")
+            user_event = store.get_interaction_event(user_event_id)
+            if assistant_event.status == "completed" and user_event is not None and user_event.status == "completed":
+                return ttft_ms, int((time.perf_counter() - started) * 1000)
+            if user_event is not None and user_event.status == "failed":
+                raise RuntimeError(user_event.error or f"User event {user_event_id} failed")
+        user_event = store.get_interaction_event(user_event_id)
+        if user_event is not None and user_event.status == "failed":
+            raise RuntimeError(user_event.error or f"User event {user_event_id} failed")
+        await asyncio.sleep(0.05)
+    raise TimeoutError(f"Timed out waiting for assistant completion for {user_event_id}")
+
+async def _await_performance_exchange(user_event_id: str, timeout_s: float = 20.0):
+    started = time.perf_counter()
+    while time.perf_counter() - started < timeout_s:
+        perf = store.get_performance_exchange_for_user_event(user_event_id)
+        if perf is not None:
+            return perf
+        await asyncio.sleep(0.05)
+    raise RuntimeError(f"Missing performance exchange for baseline user event {user_event_id}")
+
+
 async def _run_single_turn_case(
     effective_prompt: str,
     case_id: str,
@@ -481,6 +537,42 @@ async def _run_system_prompt_pressure_case(
     )
 
 
+async def _run_single_turn_case_end_to_end(
+    case_id: str,
+    label: str,
+    task_instruction: str,
+    input_tokens: int,
+    on_progress=None,
+) -> BaselineCaseResult:
+    if on_progress is not None:
+        on_progress(label, 0)
+    conversation_id, _ = store.create_conversation(title=label)
+    user_payload = _build_user_payload(input_tokens, f"{label} input")
+    user_event = _enqueue_chat_message(conversation_id, f"{task_instruction}\n\n{user_payload}")
+    ttft_ms, total_latency_ms = await _await_end_to_end_turn(conversation_id, user_event.id)
+    perf = await _await_performance_exchange(user_event.id)
+    if on_progress is not None:
+        on_progress(label, 1)
+    prompt_tokens = perf.prompt_tokens or 0
+    completion_tokens = perf.completion_tokens or 0
+    total_tokens = perf.total_tokens or (prompt_tokens + completion_tokens)
+    return BaselineCaseResult(
+        id=case_id,
+        label=label,
+        calls=1,
+        input_tokens_est=_estimate_tokens_for_text(user_payload),
+        ttft_ms=ttft_ms,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=total_tokens,
+        total_latency_ms=total_latency_ms,
+        avg_latency_ms=float(total_latency_ms),
+        min_latency_ms=total_latency_ms,
+        max_latency_ms=total_latency_ms,
+        completion_time_ms=total_latency_ms,
+    )
+
+
 async def _run_multi_turn_case(
     effective_prompt: str,
     case_id: str,
@@ -553,6 +645,69 @@ async def _run_multi_turn_case(
     )
 
 
+async def _run_multi_turn_case_end_to_end(
+    case_id: str,
+    label: str,
+    task_instruction: str,
+    turn_targets: list[int],
+    on_progress=None,
+) -> BaselineCaseResult:
+    conversation_id, _ = store.create_conversation(title=label)
+    prompt_total = 0
+    completion_total = 0
+    token_total = 0
+    latency_total = 0
+    per_turn_latency_ms: list[int] = []
+    per_turn_ttft_ms: list[int] = []
+    per_turn_prompt_tokens: list[int] = []
+    per_turn_completion_tokens: list[int] = []
+    input_total = 0
+
+    for idx, target in enumerate(turn_targets):
+        step = f"{label} (turn {idx + 1}/{len(turn_targets)})"
+        if on_progress is not None:
+            on_progress(step, 0)
+        user_payload = _build_user_payload(target, f"{label} turn {idx + 1}")
+        input_total += _estimate_tokens_for_text(user_payload)
+        user_event = _enqueue_chat_message(conversation_id, f"{task_instruction}\n\nTurn {idx + 1}:\n{user_payload}")
+        ttft_ms, latency_ms = await _await_end_to_end_turn(conversation_id, user_event.id)
+        perf = await _await_performance_exchange(user_event.id)
+        prompt_tokens = perf.prompt_tokens or 0
+        completion_tokens = perf.completion_tokens or 0
+        total_tokens = perf.total_tokens or (prompt_tokens + completion_tokens)
+        latency_total += latency_ms
+        per_turn_latency_ms.append(latency_ms)
+        per_turn_ttft_ms.append(ttft_ms if ttft_ms is not None else latency_ms)
+        per_turn_prompt_tokens.append(prompt_tokens)
+        per_turn_completion_tokens.append(completion_tokens)
+        prompt_total += prompt_tokens
+        completion_total += completion_tokens
+        token_total += total_tokens
+        if on_progress is not None:
+            on_progress(step, 1)
+
+    calls = len(turn_targets)
+    return BaselineCaseResult(
+        id=case_id,
+        label=label,
+        calls=calls,
+        input_tokens_est=input_total,
+        ttft_ms=min(per_turn_ttft_ms) if per_turn_ttft_ms else None,
+        prompt_tokens=prompt_total,
+        completion_tokens=completion_total,
+        total_tokens=token_total,
+        total_latency_ms=latency_total,
+        avg_latency_ms=(float(latency_total) / float(calls)) if calls > 0 else 0.0,
+        min_latency_ms=min(per_turn_latency_ms) if per_turn_latency_ms else None,
+        max_latency_ms=max(per_turn_latency_ms) if per_turn_latency_ms else None,
+        completion_time_ms=max(per_turn_latency_ms) if per_turn_latency_ms else None,
+        per_turn_latency_ms=per_turn_latency_ms,
+        per_turn_ttft_ms=per_turn_ttft_ms,
+        per_turn_prompt_tokens=per_turn_prompt_tokens,
+        per_turn_completion_tokens=per_turn_completion_tokens,
+    )
+
+
 def _make_baseline_status(job_id: str) -> BaselineJobStatusResponse:
     job = _baseline_jobs[job_id]
     return BaselineJobStatusResponse(
@@ -597,114 +752,196 @@ def _baseline_total_calls() -> int:
     return 34
 
 
-async def _execute_baseline(job_id: str, enforce_max_response_tokens: bool) -> BaselineRunResponse:
+async def _execute_baseline(job_id: str, enforce_max_response_tokens: bool, mode: str = "direct_model") -> BaselineRunResponse:
     started_at = datetime.now(timezone.utc)
     started = time.perf_counter()
     _, effective_components = _effective_prompt_components()
     effective_prompt = compose_system_prompt(effective_components)
     context_settings = _get_context_settings()
     baseline_max_tokens = context_settings.max_response_tokens if enforce_max_response_tokens else None
-
-    simple_qa_cases = [
-        await _run_single_turn_case(
-            effective_prompt,
-            case_id="qa_100",
-            label="Simple Q/A (100 user tokens)",
-            task_instruction="Answer directly in 6-10 concise sentences.",
-            input_tokens=100,
-            max_response_tokens=baseline_max_tokens,
-            on_progress=lambda step, inc: _baseline_progress(job_id, step, inc),
-        ),
-        await _run_single_turn_case(
-            effective_prompt,
-            case_id="qa_250",
-            label="Simple Q/A (250 user tokens)",
-            task_instruction="Answer directly in 6-10 concise sentences.",
-            input_tokens=250,
-            max_response_tokens=baseline_max_tokens,
-            on_progress=lambda step, inc: _baseline_progress(job_id, step, inc),
-        ),
-        await _run_single_turn_case(
-            effective_prompt,
-            case_id="qa_500",
-            label="Simple Q/A (500 user tokens)",
-            task_instruction="Answer directly in 6-10 concise sentences.",
-            input_tokens=500,
-            max_response_tokens=baseline_max_tokens,
-            on_progress=lambda step, inc: _baseline_progress(job_id, step, inc),
-        ),
-    ]
-
-    summarization_cases = [
-        await _run_single_turn_case(
-            effective_prompt,
-            case_id="sum_200",
-            label="Summarization (200 user tokens)",
-            task_instruction="Summarize the content in 5 bullet points.",
-            input_tokens=200,
-            max_response_tokens=baseline_max_tokens,
-            on_progress=lambda step, inc: _baseline_progress(job_id, step, inc),
-        ),
-        await _run_single_turn_case(
-            effective_prompt,
-            case_id="sum_500",
-            label="Summarization (500 user tokens)",
-            task_instruction="Summarize the content in 5 bullet points.",
-            input_tokens=500,
-            max_response_tokens=baseline_max_tokens,
-            on_progress=lambda step, inc: _baseline_progress(job_id, step, inc),
-        ),
-        await _run_single_turn_case(
-            effective_prompt,
-            case_id="sum_1000",
-            label="Summarization (1000 user tokens)",
-            task_instruction="Summarize the content in 8 bullet points.",
-            input_tokens=1000,
-            max_response_tokens=baseline_max_tokens,
-            on_progress=lambda step, inc: _baseline_progress(job_id, step, inc),
-        ),
-        await _run_single_turn_case(
-            effective_prompt,
-            case_id="sum_2000",
-            label="Summarization (2000 user tokens)",
-            task_instruction="Summarize the content in 10 bullet points.",
-            input_tokens=2000,
-            max_response_tokens=baseline_max_tokens,
-            on_progress=lambda step, inc: _baseline_progress(job_id, step, inc),
-        ),
-    ]
-
-    multi_turn_targets = [50 + ((i * 17) % 151) for i in range(20)]
-    multi_turn_cases = [
-        await _run_multi_turn_case(
-            effective_prompt,
-            case_id="mt_20x_50_200",
-            label="20-turn conversation (50-200 user tokens/turn)",
-            task_instruction=(
-                "Maintain consistency across turns and preserve key decisions while answering each turn concisely."
+    if mode == "end_to_end_aigentos":
+        simple_qa_cases = [
+            await _run_single_turn_case_end_to_end(
+                case_id="qa_100",
+                label="Simple Q/A (100 user tokens)",
+                task_instruction="Answer directly in 6-10 concise sentences.",
+                input_tokens=100,
+                on_progress=lambda step, inc: _baseline_progress(job_id, step, inc),
             ),
-            turn_targets=multi_turn_targets,
-            max_response_tokens=baseline_max_tokens,
-            on_progress=lambda step, inc: _baseline_progress(job_id, step, inc),
-        )
-    ]
-
-    extraction_cases = [
-        await _run_single_turn_case(
-            effective_prompt,
-            case_id="extract_400",
-            label="Structured Extraction (400 user tokens)",
-            task_instruction=(
-                "Extract entities into JSON with keys: people, organizations, dates, locations, and actions."
+            await _run_single_turn_case_end_to_end(
+                case_id="qa_250",
+                label="Simple Q/A (250 user tokens)",
+                task_instruction="Answer directly in 6-10 concise sentences.",
+                input_tokens=250,
+                on_progress=lambda step, inc: _baseline_progress(job_id, step, inc),
             ),
-            input_tokens=400,
-            max_response_tokens=baseline_max_tokens,
-            on_progress=lambda step, inc: _baseline_progress(job_id, step, inc),
-        )
-    ]
+            await _run_single_turn_case_end_to_end(
+                case_id="qa_500",
+                label="Simple Q/A (500 user tokens)",
+                task_instruction="Answer directly in 6-10 concise sentences.",
+                input_tokens=500,
+                on_progress=lambda step, inc: _baseline_progress(job_id, step, inc),
+            ),
+        ]
+
+        summarization_cases = [
+            await _run_single_turn_case_end_to_end(
+                case_id="sum_200",
+                label="Summarization (200 user tokens)",
+                task_instruction="Summarize the content in 5 bullet points.",
+                input_tokens=200,
+                on_progress=lambda step, inc: _baseline_progress(job_id, step, inc),
+            ),
+            await _run_single_turn_case_end_to_end(
+                case_id="sum_500",
+                label="Summarization (500 user tokens)",
+                task_instruction="Summarize the content in 5 bullet points.",
+                input_tokens=500,
+                on_progress=lambda step, inc: _baseline_progress(job_id, step, inc),
+            ),
+            await _run_single_turn_case_end_to_end(
+                case_id="sum_1000",
+                label="Summarization (1000 user tokens)",
+                task_instruction="Summarize the content in 8 bullet points.",
+                input_tokens=1000,
+                on_progress=lambda step, inc: _baseline_progress(job_id, step, inc),
+            ),
+            await _run_single_turn_case_end_to_end(
+                case_id="sum_2000",
+                label="Summarization (2000 user tokens)",
+                task_instruction="Summarize the content in 10 bullet points.",
+                input_tokens=2000,
+                on_progress=lambda step, inc: _baseline_progress(job_id, step, inc),
+            ),
+        ]
+
+        multi_turn_targets = [50 + ((i * 17) % 151) for i in range(20)]
+        multi_turn_cases = [
+            await _run_multi_turn_case_end_to_end(
+                case_id="mt_20x_50_200",
+                label="20-turn conversation (50-200 user tokens/turn)",
+                task_instruction=(
+                    "Maintain consistency across turns and preserve key decisions while answering each turn concisely."
+                ),
+                turn_targets=multi_turn_targets,
+                on_progress=lambda step, inc: _baseline_progress(job_id, step, inc),
+            )
+        ]
+
+        extraction_cases = [
+            await _run_single_turn_case_end_to_end(
+                case_id="extract_400",
+                label="Structured Extraction (400 user tokens)",
+                task_instruction=(
+                    "Extract entities into JSON with keys: people, organizations, dates, locations, and actions."
+                ),
+                input_tokens=400,
+                on_progress=lambda step, inc: _baseline_progress(job_id, step, inc),
+            )
+        ]
+    else:
+        simple_qa_cases = [
+            await _run_single_turn_case(
+                effective_prompt,
+                case_id="qa_100",
+                label="Simple Q/A (100 user tokens)",
+                task_instruction="Answer directly in 6-10 concise sentences.",
+                input_tokens=100,
+                max_response_tokens=baseline_max_tokens,
+                on_progress=lambda step, inc: _baseline_progress(job_id, step, inc),
+            ),
+            await _run_single_turn_case(
+                effective_prompt,
+                case_id="qa_250",
+                label="Simple Q/A (250 user tokens)",
+                task_instruction="Answer directly in 6-10 concise sentences.",
+                input_tokens=250,
+                max_response_tokens=baseline_max_tokens,
+                on_progress=lambda step, inc: _baseline_progress(job_id, step, inc),
+            ),
+            await _run_single_turn_case(
+                effective_prompt,
+                case_id="qa_500",
+                label="Simple Q/A (500 user tokens)",
+                task_instruction="Answer directly in 6-10 concise sentences.",
+                input_tokens=500,
+                max_response_tokens=baseline_max_tokens,
+                on_progress=lambda step, inc: _baseline_progress(job_id, step, inc),
+            ),
+        ]
+
+        summarization_cases = [
+            await _run_single_turn_case(
+                effective_prompt,
+                case_id="sum_200",
+                label="Summarization (200 user tokens)",
+                task_instruction="Summarize the content in 5 bullet points.",
+                input_tokens=200,
+                max_response_tokens=baseline_max_tokens,
+                on_progress=lambda step, inc: _baseline_progress(job_id, step, inc),
+            ),
+            await _run_single_turn_case(
+                effective_prompt,
+                case_id="sum_500",
+                label="Summarization (500 user tokens)",
+                task_instruction="Summarize the content in 5 bullet points.",
+                input_tokens=500,
+                max_response_tokens=baseline_max_tokens,
+                on_progress=lambda step, inc: _baseline_progress(job_id, step, inc),
+            ),
+            await _run_single_turn_case(
+                effective_prompt,
+                case_id="sum_1000",
+                label="Summarization (1000 user tokens)",
+                task_instruction="Summarize the content in 8 bullet points.",
+                input_tokens=1000,
+                max_response_tokens=baseline_max_tokens,
+                on_progress=lambda step, inc: _baseline_progress(job_id, step, inc),
+            ),
+            await _run_single_turn_case(
+                effective_prompt,
+                case_id="sum_2000",
+                label="Summarization (2000 user tokens)",
+                task_instruction="Summarize the content in 10 bullet points.",
+                input_tokens=2000,
+                max_response_tokens=baseline_max_tokens,
+                on_progress=lambda step, inc: _baseline_progress(job_id, step, inc),
+            ),
+        ]
+
+        multi_turn_targets = [50 + ((i * 17) % 151) for i in range(20)]
+        multi_turn_cases = [
+            await _run_multi_turn_case(
+                effective_prompt,
+                case_id="mt_20x_50_200",
+                label="20-turn conversation (50-200 user tokens/turn)",
+                task_instruction=(
+                    "Maintain consistency across turns and preserve key decisions while answering each turn concisely."
+                ),
+                turn_targets=multi_turn_targets,
+                max_response_tokens=baseline_max_tokens,
+                on_progress=lambda step, inc: _baseline_progress(job_id, step, inc),
+            )
+        ]
+
+        extraction_cases = [
+            await _run_single_turn_case(
+                effective_prompt,
+                case_id="extract_400",
+                label="Structured Extraction (400 user tokens)",
+                task_instruction=(
+                    "Extract entities into JSON with keys: people, organizations, dates, locations, and actions."
+                ),
+                input_tokens=400,
+                max_response_tokens=baseline_max_tokens,
+                on_progress=lambda step, inc: _baseline_progress(job_id, step, inc),
+            )
+        ]
 
     system_prompt_targets = [200, 500, 1000, 2000, 5000, 10000]
     system_prompt_cases: list[BaselineCaseResult] = []
+    if mode == "end_to_end_aigentos":
+        _append_baseline_event(job_id, "System Prompt Pressure uses direct model mode in 0.2.3-oss")
     for idx, target in enumerate(system_prompt_targets):
         user_tokens = 100 + ((idx * 37) % 201)
         system_prompt_cases.append(
@@ -732,6 +969,7 @@ async def _execute_baseline(job_id: str, enforce_max_response_tokens: bool) -> B
     total_calls = sum(case.calls for category in categories for case in category.cases)
     return BaselineRunResponse(
         model=settings.ollama_model,
+        mode=mode,
         started_at=started_at,
         completed_at=completed_at,
         duration_ms=duration_ms,
@@ -1151,7 +1389,11 @@ async def performance_summary() -> PerformanceSummaryResponse:
 async def _run_baseline_background(job_id: str) -> None:
     try:
         job = _baseline_jobs[job_id]
-        result = await _execute_baseline(job_id, enforce_max_response_tokens=bool(job.get("enforce_max_response_tokens", True)))
+        result = await _execute_baseline(
+            job_id,
+            enforce_max_response_tokens=bool(job.get("enforce_max_response_tokens", True)),
+            mode=str(job.get("mode", "direct_model")),
+        )
         job = _baseline_jobs[job_id]
         job["status"] = "completed"
         job["result"] = result
@@ -1189,7 +1431,12 @@ async def start_baseline(payload: BaselineStartRequest | None = None) -> Baselin
         "error": None,
         "result": None,
         "enforce_max_response_tokens": payload.enforce_max_response_tokens,
+        "mode": payload.mode,
     }
+    _append_baseline_event(
+        job_id,
+        f"Baseline mode: {'End-to-end AIgentOS' if payload.mode == 'end_to_end_aigentos' else 'Direct model'}",
+    )
     if payload.enforce_max_response_tokens:
         _append_baseline_event(job_id, "Mode: enforcing max response tokens")
     else:
@@ -1224,12 +1471,21 @@ async def run_baseline(payload: BaselineStartRequest | None = None) -> BaselineR
         "error": None,
         "result": None,
         "enforce_max_response_tokens": payload.enforce_max_response_tokens,
+        "mode": payload.mode,
     }
+    _append_baseline_event(
+        job_id,
+        f"Baseline mode: {'End-to-end AIgentOS' if payload.mode == 'end_to_end_aigentos' else 'Direct model'}",
+    )
     if payload.enforce_max_response_tokens:
         _append_baseline_event(job_id, "Mode: enforcing max response tokens")
     else:
         _append_baseline_event(job_id, "Mode: no max response token cap")
-    result = await _execute_baseline(job_id, enforce_max_response_tokens=payload.enforce_max_response_tokens)
+    result = await _execute_baseline(
+        job_id,
+        enforce_max_response_tokens=payload.enforce_max_response_tokens,
+        mode=payload.mode,
+    )
     _baseline_jobs[job_id]["status"] = "completed"
     _baseline_jobs[job_id]["result"] = result
     _baseline_jobs[job_id]["completed_at"] = datetime.now(timezone.utc)

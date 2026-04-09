@@ -80,6 +80,8 @@ class StoredRetrievedChunk:
 class StoredPerformanceExchange:
     id: str
     conversation_id: str
+    user_event_id: str | None
+    assistant_event_id: str | None
     created_at: datetime
     user_preview: str
     assistant_preview: str
@@ -190,6 +192,8 @@ class ChatStore:
                 CREATE TABLE IF NOT EXISTS performance_exchanges (
                     id TEXT PRIMARY KEY,
                     conversation_id TEXT NOT NULL,
+                    user_event_id TEXT,
+                    assistant_event_id TEXT,
                     created_at TEXT NOT NULL,
                     user_preview TEXT NOT NULL,
                     assistant_preview TEXT NOT NULL,
@@ -261,6 +265,10 @@ class ChatStore:
             }
             if "ttft_ms" not in columns:
                 conn.execute("ALTER TABLE performance_exchanges ADD COLUMN ttft_ms INTEGER")
+            if "user_event_id" not in columns:
+                conn.execute("ALTER TABLE performance_exchanges ADD COLUMN user_event_id TEXT")
+            if "assistant_event_id" not in columns:
+                conn.execute("ALTER TABLE performance_exchanges ADD COLUMN assistant_event_id TEXT")
             if "retrieved_chunk_count" not in columns:
                 conn.execute(
                     "ALTER TABLE performance_exchanges ADD COLUMN retrieved_chunk_count INTEGER NOT NULL DEFAULT 0"
@@ -685,6 +693,8 @@ class ChatStore:
     def add_performance_exchange(
         self,
         conversation_id: str,
+        user_event_id: str | None,
+        assistant_event_id: str | None,
         user_preview: str,
         assistant_preview: str,
         total_latency_ms: int,
@@ -707,15 +717,17 @@ class ChatStore:
             conn.execute(
                 """
                 INSERT INTO performance_exchanges(
-                    id, conversation_id, created_at, user_preview, assistant_preview,
+                    id, conversation_id, user_event_id, assistant_event_id, created_at, user_preview, assistant_preview,
                     total_latency_ms, llm_latency_ms, ttft_ms, prompt_tokens, completion_tokens, total_tokens,
                     retrieved_chunk_count, retrieved_chunks,
                     system_chars, user_chars, assistant_chars, system_tokens_est, user_tokens_est, assistant_tokens_est
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     exchange_id,
                     conversation_id,
+                    user_event_id,
+                    assistant_event_id,
                     now,
                     user_preview,
                     assistant_preview,
@@ -751,7 +763,7 @@ class ChatStore:
         with self._conn as conn:
             rows = conn.execute(
                 """
-                SELECT id, conversation_id, created_at, user_preview, assistant_preview,
+                SELECT id, conversation_id, user_event_id, assistant_event_id, created_at, user_preview, assistant_preview,
                        total_latency_ms, llm_latency_ms, ttft_ms, prompt_tokens, completion_tokens, total_tokens,
                        retrieved_chunk_count, retrieved_chunks,
                        system_chars, user_chars, assistant_chars, system_tokens_est, user_tokens_est, assistant_tokens_est
@@ -765,6 +777,8 @@ class ChatStore:
             StoredPerformanceExchange(
                 id=row["id"],
                 conversation_id=row["conversation_id"],
+                user_event_id=row["user_event_id"],
+                assistant_event_id=row["assistant_event_id"],
                 created_at=_utc_from_iso(row["created_at"]),
                 user_preview=row["user_preview"],
                 assistant_preview=row["assistant_preview"],
@@ -800,7 +814,7 @@ class ChatStore:
         with self._conn as conn:
             row = conn.execute(
                 """
-                SELECT id, conversation_id, created_at, user_preview, assistant_preview,
+                SELECT id, conversation_id, user_event_id, assistant_event_id, created_at, user_preview, assistant_preview,
                        total_latency_ms, llm_latency_ms, ttft_ms, prompt_tokens, completion_tokens, total_tokens,
                        retrieved_chunk_count, retrieved_chunks,
                        system_chars, user_chars, assistant_chars, system_tokens_est, user_tokens_est, assistant_tokens_est
@@ -816,6 +830,59 @@ class ChatStore:
         return StoredPerformanceExchange(
             id=row["id"],
             conversation_id=row["conversation_id"],
+            user_event_id=row["user_event_id"],
+            assistant_event_id=row["assistant_event_id"],
+            created_at=_utc_from_iso(row["created_at"]),
+            user_preview=row["user_preview"],
+            assistant_preview=row["assistant_preview"],
+            total_latency_ms=int(row["total_latency_ms"]),
+            llm_latency_ms=int(row["llm_latency_ms"]),
+            ttft_ms=row["ttft_ms"],
+            prompt_tokens=row["prompt_tokens"],
+            completion_tokens=row["completion_tokens"],
+            total_tokens=row["total_tokens"],
+            retrieved_chunk_count=int(row["retrieved_chunk_count"] or 0),
+            retrieved_chunks=[
+                StoredRetrievedChunk(
+                    content=str(item.get("content", "")),
+                    score=float(item.get("score", 0.0)),
+                    source_id=str(item.get("source_id", "")),
+                    source_type=str(item.get("source_type", "")),
+                    source_preview=str(item.get("source_preview", "")),
+                )
+                for item in json.loads(row["retrieved_chunks"] or "[]")
+                if isinstance(item, dict)
+            ],
+            system_chars=int(row["system_chars"]),
+            user_chars=int(row["user_chars"]),
+            assistant_chars=int(row["assistant_chars"]),
+            system_tokens_est=row["system_tokens_est"],
+            user_tokens_est=row["user_tokens_est"],
+            assistant_tokens_est=row["assistant_tokens_est"],
+        )
+
+    def get_performance_exchange_for_user_event(self, user_event_id: str) -> StoredPerformanceExchange | None:
+        with self._conn as conn:
+            row = conn.execute(
+                """
+                SELECT id, conversation_id, user_event_id, assistant_event_id, created_at, user_preview, assistant_preview,
+                       total_latency_ms, llm_latency_ms, ttft_ms, prompt_tokens, completion_tokens, total_tokens,
+                       retrieved_chunk_count, retrieved_chunks,
+                       system_chars, user_chars, assistant_chars, system_tokens_est, user_tokens_est, assistant_tokens_est
+                FROM performance_exchanges
+                WHERE user_event_id = ?
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (user_event_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return StoredPerformanceExchange(
+            id=row["id"],
+            conversation_id=row["conversation_id"],
+            user_event_id=row["user_event_id"],
+            assistant_event_id=row["assistant_event_id"],
             created_at=_utc_from_iso(row["created_at"]),
             user_preview=row["user_preview"],
             assistant_preview=row["assistant_preview"],

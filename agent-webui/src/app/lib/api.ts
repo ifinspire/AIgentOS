@@ -209,6 +209,7 @@ export interface ApiBaselineCategoryResult {
 
 export interface ApiBaselineRunResponse {
   model: string;
+  mode: "direct_model" | "end_to_end_aigentos";
   started_at: string;
   completed_at: string;
   duration_ms: number;
@@ -223,6 +224,7 @@ export interface ApiBaselineJobStartResponse {
 
 export interface ApiBaselineStartRequest {
   enforce_max_response_tokens?: boolean;
+  mode?: "direct_model" | "end_to_end_aigentos";
 }
 
 export interface ApiBaselineJobStatusResponse {
@@ -421,14 +423,14 @@ export const api = {
   async runBaseline(payload?: ApiBaselineStartRequest) {
     return request<ApiBaselineRunResponse>("/api/baseline/run", {
       method: "POST",
-      body: JSON.stringify(payload ?? { enforce_max_response_tokens: true }),
+      body: JSON.stringify(payload ?? { enforce_max_response_tokens: true, mode: "direct_model" }),
     });
   },
 
   async startBaseline(payload?: ApiBaselineStartRequest) {
     return request<ApiBaselineJobStartResponse>("/api/baseline/start", {
       method: "POST",
-      body: JSON.stringify(payload ?? { enforce_max_response_tokens: true }),
+      body: JSON.stringify(payload ?? { enforce_max_response_tokens: true, mode: "direct_model" }),
     });
   },
 

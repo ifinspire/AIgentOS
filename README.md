@@ -33,6 +33,8 @@ This repository currently ships:
 - Performance/debug API surfaces with TTFT tracking, token breakdowns, and baseline benchmarking
 - A Vite/React WebUI (`/agent-webui`) as an optional interface
 
+Current release line: `v0.2.3-oss`
+
 ## Why One Repo (for now)
 
 We keep kernel and WebUI in one repo right now for simpler OSS onboarding, versioning, and CI.
@@ -131,19 +133,42 @@ Benchmark environment:
 - 18 GB RAM
 - macOS Tahoe 26.3
 
-### v0.2.0 Baseline (2026-04-06)
+### v0.2.3-oss End-to-End Baseline (2026-04-08)
 
-3 runs on `alibayram/smollm3` with `max_response_tokens=1024` (doubled from v0.1.0's 512).
+v0.2.3-oss adds a baseline mode toggle:
+- **Direct model**: benchmarks the raw prompt → LLM → response path (what v0.2.0 and v0.1.0 measured)
+- **End-to-end AIgentOS**: benchmarks the real product path — `POST /api/chat` → async dialogue worker → assistant event completion — the same flow a user experiences when sending a message
+
+For `AIgentOS-GH`, E2E mode measures the actual async worker architecture introduced in v0.2.0, without the later v0.3.0 orchestrator layer. This makes it possible to separate base model/runtime behavior from async worker + persistence + event delivery overhead.
+
+3 E2E runs on `alibayram/smollm3` with `max_response_tokens=1024`:
+
+| Report | Mode | Completed (local) | Duration | Simple Q/A min-max | Summarization min-max | 20-turn per-turn min-max | Structured extraction | System prompt pressure min-max | TTFT min-max | 20-turn tok/s |
+|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| [baseline-e2e-20260408-192201.md](baseline/perf/baseline-e2e-20260408-192201.md) | E2E | 2026-04-08 19:19:25 | 253.9s | 6.08s-11.71s | 3.77s-7.95s | 2.78s-11.05s | 6.65s | 2.45s-18.75s | 626ms-12.34s | 7.6-27.4 |
+| [baseline-e2e-20260408-195417.md](baseline/perf/baseline-e2e-20260408-195417.md) | E2E | 2026-04-08 19:52:02 | 269.5s | 3.27s-10.10s | 4.33s-13.80s | 3.69s-17.17s | 5.67s | 1.77s-14.58s | 658ms-12.26s | 3.9-24.0 |
+| [baseline-e2e-20260408-200126.md](baseline/perf/baseline-e2e-20260408-200126.md) | E2E | 2026-04-08 19:58:45 | 265.8s | 3.06s-12.06s | 4.19s-13.80s | 3.59s-16.61s | 5.46s | 608ms-12.26s | 608ms-12.26s | 4.3-26.9 |
+
+Observed E2E ranges:
+- 20-turn per-turn completion: `2.78s` to `17.17s` (throughput: `3.9-27.4 tok/s`)
+- TTFT for first turn: `2.14s` to `5.95s`
+- TTFT at ~10k system tokens: `~12.3s` (consistent across all 3 runs)
+- System prompt pressure at ~10k system tokens: `13.65s` to `18.75s`
+- Summarization: `3.77s` to `13.80s`
+
+### v0.2.0 Baseline — Direct Model (2026-04-06)
+
+3 runs on `alibayram/smollm3` with `max_response_tokens=1024` (doubled from v0.1.0's 512). These runs use **Direct model** mode — the LLM is called directly, bypassing the async worker, event persistence, and SSE delivery layers.
 
 v0.2.0 adds TTFT (time-to-first-token) and per-turn throughput tracking. Reports now include token generation rates (~43-55 tok/s observed, declining as context grows).
 
-| Report | Completed (local) | Calls | Simple Q/A min-max | Summarization min-max | 20-turn min-max | Structured extraction | System prompt pressure min-max | TTFT min-max | 20-turn tok/s |
-|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| [baseline-20260406-130826.md](baseline/perf/baseline-20260406-130826.md) | 2026-04-06 13:08:13 | 34 | 11.11s-18.59s | 2.91s-4.37s | 4.53s-9.04s | 3.30s | 2.27s-16.24s | 340ms-12.22s | 43-56 |
-| [baseline-20260406-131132.md](baseline/perf/baseline-20260406-131132.md) | 2026-04-06 13:11:24 | 34 | 6.15s-18.74s | 2.30s-5.28s | 2.38s-3.71s | 3.45s | 2.60s-13.28s | 338ms-12.21s | 44-53 |
-| [baseline-20260406-131642.md](baseline/perf/baseline-20260406-131642.md) | 2026-04-06 13:16:21 | 34 | 2.91s-13.67s | 3.83s-4.72s | 3.44s-6.40s | 2.83s | 1.84s-14.24s | 350ms-12.21s | 43-54 |
+| Report | Mode | Completed (local) | Calls | Simple Q/A min-max | Summarization min-max | 20-turn min-max | Structured extraction | System prompt pressure min-max | TTFT min-max | 20-turn tok/s |
+|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| [baseline-20260406-130826.md](baseline/perf/baseline-20260406-130826.md) | Direct | 2026-04-06 13:08:13 | 34 | 11.11s-18.59s | 2.91s-4.37s | 4.53s-9.04s | 3.30s | 2.27s-16.24s | 340ms-12.22s | 43-56 |
+| [baseline-20260406-131132.md](baseline/perf/baseline-20260406-131132.md) | Direct | 2026-04-06 13:11:24 | 34 | 6.15s-18.74s | 2.30s-5.28s | 2.38s-3.71s | 3.45s | 2.60s-13.28s | 338ms-12.21s | 44-53 |
+| [baseline-20260406-131642.md](baseline/perf/baseline-20260406-131642.md) | Direct | 2026-04-06 13:16:21 | 34 | 2.91s-13.67s | 3.83s-4.72s | 3.44s-6.40s | 2.83s | 1.84s-14.24s | 350ms-12.21s | 43-54 |
 
-Observed ranges:
+Observed Direct model ranges:
 - 20-turn per-turn completion: `2.38s` to `9.04s` (throughput: `43-55 tok/s`)
 - TTFT for first turn: `295ms` to `350ms`
 - TTFT at ~10k system tokens: `~12.2s` (consistent across all 3 runs)
@@ -162,6 +187,13 @@ Observed ranges:
 
 ### Comparison Notes
 
+**E2E vs Direct model (v0.2.3-oss)**:
+- **TTFT overhead**: First-turn TTFT in E2E mode is `2.1s-5.9s` vs `295ms-350ms` in Direct mode. The ~2s floor reflects the async worker poll cycle + event persistence + SSE delivery path that real user messages travel through. At high context sizes (~10k system tokens) the gap narrows because LLM prefill dominates (`~12.3s` E2E vs `~12.2s` Direct).
+- **20-turn throughput**: E2E shows `3.9-27.4 tok/s` vs Direct's `43-55 tok/s`. The lower E2E throughput reflects per-token DB writes (the worker updates the assistant event on each streamed chunk for real-time SSE) and polling overhead. The wider range in E2E includes occasional outlier turns with spikes up to `17s` that don't appear in Direct runs.
+- **Summarization**: E2E `3.77s-13.80s` vs Direct `2.30s-5.28s`. The wider E2E ceiling comes from the worker overhead on longer completions.
+- **System prompt pressure at ~10k tokens**: comparable (`13.65s-18.75s` E2E vs `13.28s-16.24s` Direct) — at this scale the LLM prefill cost dominates and the worker overhead is proportionally small.
+
+**v0.2.0 Direct vs v0.1.0 Direct**:
 - **`max_response_tokens` change**: v0.2.0 runs with 1024 (vs 512 in v0.1.0). This allows longer completions, which increases latency for cases where the model generates more tokens. Simple Q/A ranges are wider in v0.2.0 because the model can now produce up to 1024 completion tokens per turn.
 - **Summarization** is comparable across versions since summaries naturally stay short regardless of the token cap.
 - **System prompt pressure** at 10k tokens is slightly improved in v0.2.0 (`13.28s-16.24s` vs `14.40s-22.80s`), likely due to the model warming from prior test cases in the same run and run-to-run variance.
@@ -174,6 +206,8 @@ Observed ranges:
 - The 20-turn test shows context growth impact over time.
 - When a model emits visible thinking text, baseline `completion tokens` reflect the model's full generated output budget, which can include both `<think>...</think>` content and the final visible answer.
 - The baseline `Enforce max response tokens` option uses the current runtime `max_response_tokens` setting. If that cap is increased, baseline completion lengths and latencies may increase too.
+- **Direct model** baselines (v0.1.0, v0.2.0) measure raw LLM performance — the prompt is sent directly to the model and the response is timed. This isolates model behavior from system overhead.
+- **End-to-end AIgentOS** baselines (v0.2.3-oss) measure the real product path that a user experiences: message enqueue, async worker pickup, DB event creation, streamed token persistence, and SSE delivery. This is the more honest benchmark for evaluating actual user-facing latency on this branch.
 
 ### General Perf Dashboard (for chats)
 ![AIgentOS Perf Dashboard](baseline/ui/performance.png)

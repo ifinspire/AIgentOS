@@ -2,6 +2,16 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.2.3-oss] - 2026-04-08
+
+### Added — Direct vs E2E Baseline Modes
+- Baseline runs now support `Direct model` and `End-to-end AIgentOS` modes.
+- E2E mode measures the real async `POST /api/chat -> dialogue-worker -> assistant completion` path for `AIgentOS-GH`.
+- Baseline markdown exports now include mode metadata, and E2E exports use a `baseline-e2e-...` filename.
+
+### Changed — Version Labels
+- Product/version labels updated to `v0.2.3-oss` across the kernel metadata, WebUI, and package metadata.
+
 ## [0.2.0-oss] - 2026-04-06
 
 ### Added — Async Worker Architecture
