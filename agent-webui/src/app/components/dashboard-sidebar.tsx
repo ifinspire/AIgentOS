@@ -1,19 +1,23 @@
-import { Activity, Cpu, Database, ChevronLeft, ChevronRight, FileText, Bug, FlaskConical, Brain } from 'lucide-react';
+import { Activity, Cpu, Database, ChevronLeft, ChevronRight, FileText, Bug, FlaskConical, Brain, Files, Bot, PlugZap } from 'lucide-react';
 
-export type DashboardSection = 'prompts' | 'performance' | 'baseline' | 'memory' | 'debug' | 'database' | 'logs';
+export type DashboardSection = 'orchestration' | 'mcp' | 'prompts' | 'performance' | 'baseline' | 'memory' | 'documents' | 'debug' | 'database' | 'logs';
 
 interface DashboardSidebarProps {
   activeSection: DashboardSection;
   onSectionChange: (section: DashboardSection) => void;
   isCollapsed: boolean;
   onToggleCollapse: () => void;
+  version?: string;
 }
 
 const sections = [
+  { id: 'orchestration' as DashboardSection, label: 'Orchestration', icon: Bot },
+  { id: 'mcp' as DashboardSection, label: 'MCP', icon: PlugZap },
   { id: 'prompts' as DashboardSection, label: 'Prompts', icon: FileText },
   { id: 'performance' as DashboardSection, label: 'Performance', icon: Activity },
   { id: 'baseline' as DashboardSection, label: 'Baseline', icon: FlaskConical },
   { id: 'memory' as DashboardSection, label: 'Memory', icon: Brain },
+  { id: 'documents' as DashboardSection, label: 'Documents', icon: Files },
   { id: 'debug' as DashboardSection, label: 'Debug', icon: Bug },
   { id: 'database' as DashboardSection, label: 'Database', icon: Database },
   { id: 'logs' as DashboardSection, label: 'Logs', icon: Cpu }
@@ -23,7 +27,8 @@ export function DashboardSidebar({
   activeSection,
   onSectionChange,
   isCollapsed,
-  onToggleCollapse
+  onToggleCollapse,
+  version = "unknown",
 }: DashboardSidebarProps) {
   if (isCollapsed) {
     return (
@@ -111,7 +116,7 @@ export function DashboardSidebar({
           </div>
           <div className="flex justify-between">
             <span>Version</span>
-            <span className="font-medium" style={{ color: 'var(--aigent-color-text)' }}>v0.2.4-oss</span>
+            <span className="font-medium" style={{ color: 'var(--aigent-color-text)' }}>v{version}</span>
           </div>
         </div>
       </div>

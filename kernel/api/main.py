@@ -4,10 +4,13 @@ from pathlib import Path
 import time
 from datetime import datetime, timezone
 import asyncio
+import hashlib
 import json
+import os
+import shutil
 import uuid
 
-from fastapi import FastAPI, HTTPException, Response, status
+from fastapi import FastAPI, File, Form, HTTPException, Response, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 import httpx
@@ -16,6 +19,7 @@ from kernel.shared.text import chunk_text, cosine_similarity, extract_visible_te
 from kernel.shared.metrics import estimate_tokens_for_messages, estimate_tokens_for_text, allocate_estimated_tokens
 
 from .llm import ChatMessageIn, OllamaClient, OllamaEmbeddingClient
+from .mcp import McpClientError, discover_tools as discover_mcp_tools, ensure_default_markitdown_server, discover_enabled_servers
 from .models import (
     BaselineJobStartResponse,
     BaselineStartRequest,
@@ -33,8 +37,10 @@ from .models import (
     ContextSettingsUpdateRequest,
     DeleteAllDataRequest,
     DeleteAllDataResponse,
+    DocumentImportResponse,
     DebugLogResponse,
     HealthResponse,
+    BackgroundUpdateResponse,
     PerformanceMetrics,
     PerformanceExchange,
     PerformanceSummaryResponse,
@@ -51,8 +57,11 @@ from .models import (
     WarmupResponse,
     InteractionEventResponse,
     MessageResponse,
+    McpServerCreateRequest,
+    McpServerResponse,
+    McpServerUpdateRequest,
 )
-from .prompts import compose_system_prompt, load_prompt_bundle, load_prompt_components
+from .prompts import compose_system_prompt, load_prompt_bundle, load_prompt_components, load_orchestrator_prompts
 from .settings import get_settings
 from .storage import ChatStore, StoredInteractionEvent
 
@@ -66,6 +75,15 @@ embedding_client = OllamaEmbeddingClient(settings.embedding_base_url, settings.e
 _warmup_lock = asyncio.Lock()
 _warmup_completed_at: datetime | None = None
 _baseline_jobs: dict[str, dict] = {}
+
+
+def _ensure_default_markitdown_mcp_server() -> None:
+    ensure_default_markitdown_server(store, settings)
+
+
+async def _discover_enabled_mcp_servers_on_startup() -> None:
+    _ensure_default_markitdown_mcp_server()
+    await discover_enabled_servers(store)
 
 
 def _tenant_id() -> str:
@@ -129,6 +147,22 @@ def _effective_prompt_components():
     return profile, merged
 
 
+def _import_ack_message(filename: str) -> str:
+    return f'"{filename}" received. Processing it now.'
+
+
+def _reused_import_ack_message(filename: str, status: str) -> str:
+    if status == "completed":
+        return f'"{filename}" is already imported and ready to use.'
+    if status in {"pending", "processing"}:
+        return f'"{filename}" was already uploaded and is still processing.'
+    return f'"{filename}" was uploaded before, but processing did not complete successfully.'
+
+
+def _import_request_message(filename: str) -> str:
+    return f'Attached document: "{filename}"'
+
+
 def _window_stats(window: tuple[int, int, int, int]) -> TokenWindowStats:
     total_tokens, prompt_tokens, completion_tokens, exchange_count = window
     avg = 0.0 if exchange_count == 0 else float(total_tokens) / float(exchange_count)
@@ -142,9 +176,16 @@ def _window_stats(window: tuple[int, int, int, int]) -> TokenWindowStats:
 
 app = FastAPI(
     title="AIgentOS Kernel API",
-    version="0.2.4-oss",
+    version=settings.aigent_version,
     description="Minimal OSS chat API wired to Ollama",
 )
+
+_ensure_default_markitdown_mcp_server()
+
+
+@app.on_event("startup")
+async def _startup_discover_mcp_servers() -> None:
+    await _discover_enabled_mcp_servers_on_startup()
 
 app.add_middleware(
     CORSMiddleware,
@@ -218,6 +259,28 @@ def _message_from_event(event: StoredInteractionEvent) -> MessageResponse:
     )
 
 
+def _mcp_server_response(server) -> McpServerResponse:
+    return McpServerResponse(
+        id=server.id,
+        name=server.name,
+        transport=server.transport,  # type: ignore[arg-type]
+        command=server.command,
+        args=server.args,
+        url=server.url,
+        env=server.env,
+        enabled=server.enabled,
+        status=server.status,
+        last_error=server.last_error,
+        discovered_tools=server.discovered_tools,
+        created_at=server.created_at,
+        updated_at=server.updated_at,
+    )
+
+
+def _is_managed_mcp_server(server) -> bool:
+    return str(getattr(server, "name", "")).strip() == "MarkItDown MCP"
+
+
 def _conversation_events_payload(conversation_id: str) -> dict | None:
     detail = store.get_conversation_detail(conversation_id)
     if detail is None:
@@ -226,6 +289,7 @@ def _conversation_events_payload(conversation_id: str) -> dict | None:
     events = store.get_conversation_events(conversation_id)
     latest_exchange = store.get_latest_performance_exchange_for_conversation(conversation_id)
     summary = store.summarize_performance()
+    background_updates = store.list_conversation_orchestration_events(conversation_id, limit=40)
     return {
         "id": conversation_id,
         "title": title,
@@ -245,6 +309,18 @@ def _conversation_events_payload(conversation_id: str) -> dict | None:
             }
             for event in events
         ],
+        "background_updates": [
+            {
+                "id": item.id,
+                "label": item.label,
+                "status": item.status,
+                "message": item.label,
+                "detail": item.detail,
+                "payload": item.payload or None,
+                "timestamp": item.created_at.isoformat(),
+            }
+            for item in reversed(background_updates)
+        ],
         "latest_performance": (
             {
                 "id": latest_exchange.id,
@@ -259,6 +335,11 @@ def _conversation_events_payload(conversation_id: str) -> dict | None:
                     "prompt_tokens": latest_exchange.prompt_tokens,
                     "completion_tokens": latest_exchange.completion_tokens,
                     "total_tokens": latest_exchange.total_tokens,
+                    "response_source": latest_exchange.response_source,
+                    "response_policy": latest_exchange.response_policy,
+                    "llm_involved": latest_exchange.llm_involved,
+                    "tool_observations": latest_exchange.tool_observations,
+                    "workflow_trace": latest_exchange.workflow_trace,
                     "retrieved_chunk_count": latest_exchange.retrieved_chunk_count,
                     "retrieved_chunks": [
                         {
@@ -403,6 +484,15 @@ def _enqueue_chat_message(conversation_id: str, message: str) -> StoredInteracti
         content=message,
         status="pending",
     )
+    store.create_orchestration_event(
+        event_type="prepare_turn",
+        label="Searching memory",
+        detail="Queued background orchestration for this turn",
+        status="pending",
+        conversation_id=conversation_id,
+        parent_event_id=user_event.id,
+        payload={"user_message": message},
+    )
     store.maybe_set_title_from_message(conversation_id, message)
     return user_event
 
@@ -414,6 +504,7 @@ async def _await_end_to_end_turn(
 ) -> tuple[int | None, int]:
     started = time.perf_counter()
     ttft_ms: int | None = None
+    turn_context = None
     while time.perf_counter() - started < timeout_s:
         events = store.get_conversation_events(conversation_id)
         assistant_event = next(
@@ -425,22 +516,40 @@ async def _await_end_to_end_turn(
             None,
         )
         if assistant_event is not None:
-            if ttft_ms is None:
-                visible_text = extract_visible_text(assistant_event.content).strip()
-                if visible_text:
-                    ttft_ms = int((time.perf_counter() - started) * 1000)
+            if ttft_ms is None and assistant_event.content.strip():
+                ttft_ms = int((time.perf_counter() - started) * 1000)
             if assistant_event.status == "failed":
                 raise RuntimeError(assistant_event.error or f"Assistant event {assistant_event.id} failed")
-            user_event = store.get_interaction_event(user_event_id)
-            if assistant_event.status == "completed" and user_event is not None and user_event.status == "completed":
+            if assistant_event.status == "completed":
                 return ttft_ms, int((time.perf_counter() - started) * 1000)
-            if user_event is not None and user_event.status == "failed":
-                raise RuntimeError(user_event.error or f"User event {user_event_id} failed")
         user_event = store.get_interaction_event(user_event_id)
         if user_event is not None and user_event.status == "failed":
             raise RuntimeError(user_event.error or f"User event {user_event_id} failed")
+        turn_context = store.get_turn_context(user_event_id)
+        orchestration_updates = [
+            item
+            for item in store.list_conversation_orchestration_events(conversation_id, limit=60)
+            if item.parent_event_id == user_event_id
+        ]
+        failed_orchestration = next((item for item in orchestration_updates if item.status == "failed"), None)
+        if failed_orchestration is not None:
+            detail = failed_orchestration.error or failed_orchestration.detail or failed_orchestration.label
+            raise RuntimeError(f"Orchestration failed for {user_event_id}: {detail}")
+        if (
+            turn_context is not None
+            and turn_context.route_decision == "tool_response"
+            and user_event is not None
+            and user_event.status == "completed"
+            and assistant_event is None
+        ):
+            raise RuntimeError(
+                f"Turn {user_event_id} was marked tool_response and completed without an assistant event"
+            )
         await asyncio.sleep(0.05)
-    raise TimeoutError(f"Timed out waiting for assistant completion for {user_event_id}")
+    route_decision = turn_context.route_decision if turn_context is not None else "pending"
+    raise TimeoutError(
+        f"Timed out waiting for assistant completion for {user_event_id} (route_decision={route_decision})"
+    )
 
 async def _await_performance_exchange(user_event_id: str, timeout_s: float = 20.0):
     started = time.perf_counter()
@@ -467,49 +576,6 @@ async def _run_single_turn_case(
     messages = [
         ChatMessageIn(role="system", content=effective_prompt),
         ChatMessageIn(role="system", content=task_instruction),
-        ChatMessageIn(role="user", content=user_payload),
-    ]
-    started = time.perf_counter()
-    completion = await llm_client.chat(messages, max_tokens=max_response_tokens)
-    latency_ms = int((time.perf_counter() - started) * 1000)
-    prompt_tokens = completion.prompt_tokens if completion.prompt_tokens is not None else _estimate_tokens_for_messages(messages)
-    completion_tokens = completion.completion_tokens if completion.completion_tokens is not None else _estimate_tokens_for_text(completion.content)
-    total_tokens = completion.total_tokens if completion.total_tokens is not None else prompt_tokens + completion_tokens
-    if on_progress is not None:
-        on_progress(label, 1)
-    return BaselineCaseResult(
-        id=case_id,
-        label=label,
-        calls=1,
-        input_tokens_est=_estimate_tokens_for_text(user_payload),
-        ttft_ms=completion.ttft_ms,
-        prompt_tokens=prompt_tokens,
-        completion_tokens=completion_tokens,
-        total_tokens=total_tokens,
-        total_latency_ms=latency_ms,
-        avg_latency_ms=float(latency_ms),
-        min_latency_ms=latency_ms,
-        max_latency_ms=latency_ms,
-        completion_time_ms=latency_ms,
-    )
-
-
-async def _run_system_prompt_pressure_case(
-    effective_prompt: str,
-    case_id: str,
-    label: str,
-    system_tokens: int,
-    user_tokens: int,
-    max_response_tokens: int | None = None,
-    on_progress=None,
-) -> BaselineCaseResult:
-    if on_progress is not None:
-        on_progress(label, 0)
-    system_pressure = _build_system_payload(system_tokens, f"{label} system context")
-    user_payload = _build_user_payload(user_tokens, f"{label} user input")
-    messages = [
-        ChatMessageIn(role="system", content=effective_prompt),
-        ChatMessageIn(role="system", content=system_pressure),
         ChatMessageIn(role="user", content=user_payload),
     ]
     started = time.perf_counter()
@@ -570,6 +636,49 @@ async def _run_single_turn_case_end_to_end(
         min_latency_ms=total_latency_ms,
         max_latency_ms=total_latency_ms,
         completion_time_ms=total_latency_ms,
+    )
+
+
+async def _run_system_prompt_pressure_case(
+    effective_prompt: str,
+    case_id: str,
+    label: str,
+    system_tokens: int,
+    user_tokens: int,
+    max_response_tokens: int | None = None,
+    on_progress=None,
+) -> BaselineCaseResult:
+    if on_progress is not None:
+        on_progress(label, 0)
+    system_pressure = _build_system_payload(system_tokens, f"{label} system context")
+    user_payload = _build_user_payload(user_tokens, f"{label} user input")
+    messages = [
+        ChatMessageIn(role="system", content=effective_prompt),
+        ChatMessageIn(role="system", content=system_pressure),
+        ChatMessageIn(role="user", content=user_payload),
+    ]
+    started = time.perf_counter()
+    completion = await llm_client.chat(messages, max_tokens=max_response_tokens)
+    latency_ms = int((time.perf_counter() - started) * 1000)
+    prompt_tokens = completion.prompt_tokens if completion.prompt_tokens is not None else _estimate_tokens_for_messages(messages)
+    completion_tokens = completion.completion_tokens if completion.completion_tokens is not None else _estimate_tokens_for_text(completion.content)
+    total_tokens = completion.total_tokens if completion.total_tokens is not None else prompt_tokens + completion_tokens
+    if on_progress is not None:
+        on_progress(label, 1)
+    return BaselineCaseResult(
+        id=case_id,
+        label=label,
+        calls=1,
+        input_tokens_est=_estimate_tokens_for_text(user_payload),
+        ttft_ms=completion.ttft_ms,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=total_tokens,
+        total_latency_ms=latency_ms,
+        avg_latency_ms=float(latency_ms),
+        min_latency_ms=latency_ms,
+        max_latency_ms=latency_ms,
+        completion_time_ms=latency_ms,
     )
 
 
@@ -752,13 +861,14 @@ def _baseline_total_calls() -> int:
     return 34
 
 
-async def _execute_baseline(job_id: str, enforce_max_response_tokens: bool, mode: str = "direct_model") -> BaselineRunResponse:
+async def _execute_baseline(job_id: str, enforce_max_response_tokens: bool, mode: str) -> BaselineRunResponse:
     started_at = datetime.now(timezone.utc)
     started = time.perf_counter()
     _, effective_components = _effective_prompt_components()
     effective_prompt = compose_system_prompt(effective_components)
     context_settings = _get_context_settings()
     baseline_max_tokens = context_settings.max_response_tokens if enforce_max_response_tokens else None
+
     if mode == "end_to_end_aigentos":
         simple_qa_cases = [
             await _run_single_turn_case_end_to_end(
@@ -782,62 +892,6 @@ async def _execute_baseline(job_id: str, enforce_max_response_tokens: bool, mode
                 input_tokens=500,
                 on_progress=lambda step, inc: _baseline_progress(job_id, step, inc),
             ),
-        ]
-
-        summarization_cases = [
-            await _run_single_turn_case_end_to_end(
-                case_id="sum_200",
-                label="Summarization (200 user tokens)",
-                task_instruction="Summarize the content in 5 bullet points.",
-                input_tokens=200,
-                on_progress=lambda step, inc: _baseline_progress(job_id, step, inc),
-            ),
-            await _run_single_turn_case_end_to_end(
-                case_id="sum_500",
-                label="Summarization (500 user tokens)",
-                task_instruction="Summarize the content in 5 bullet points.",
-                input_tokens=500,
-                on_progress=lambda step, inc: _baseline_progress(job_id, step, inc),
-            ),
-            await _run_single_turn_case_end_to_end(
-                case_id="sum_1000",
-                label="Summarization (1000 user tokens)",
-                task_instruction="Summarize the content in 8 bullet points.",
-                input_tokens=1000,
-                on_progress=lambda step, inc: _baseline_progress(job_id, step, inc),
-            ),
-            await _run_single_turn_case_end_to_end(
-                case_id="sum_2000",
-                label="Summarization (2000 user tokens)",
-                task_instruction="Summarize the content in 10 bullet points.",
-                input_tokens=2000,
-                on_progress=lambda step, inc: _baseline_progress(job_id, step, inc),
-            ),
-        ]
-
-        multi_turn_targets = [50 + ((i * 17) % 151) for i in range(20)]
-        multi_turn_cases = [
-            await _run_multi_turn_case_end_to_end(
-                case_id="mt_20x_50_200",
-                label="20-turn conversation (50-200 user tokens/turn)",
-                task_instruction=(
-                    "Maintain consistency across turns and preserve key decisions while answering each turn concisely."
-                ),
-                turn_targets=multi_turn_targets,
-                on_progress=lambda step, inc: _baseline_progress(job_id, step, inc),
-            )
-        ]
-
-        extraction_cases = [
-            await _run_single_turn_case_end_to_end(
-                case_id="extract_400",
-                label="Structured Extraction (400 user tokens)",
-                task_instruction=(
-                    "Extract entities into JSON with keys: people, organizations, dates, locations, and actions."
-                ),
-                input_tokens=400,
-                on_progress=lambda step, inc: _baseline_progress(job_id, step, inc),
-            )
         ]
     else:
         simple_qa_cases = [
@@ -870,6 +924,14 @@ async def _execute_baseline(job_id: str, enforce_max_response_tokens: bool, mode
             ),
         ]
 
+    if mode == "end_to_end_aigentos":
+        summarization_cases = [
+            await _run_single_turn_case_end_to_end("sum_200", "Summarization (200 user tokens)", "Summarize the content in 5 bullet points.", 200, on_progress=lambda step, inc: _baseline_progress(job_id, step, inc)),
+            await _run_single_turn_case_end_to_end("sum_500", "Summarization (500 user tokens)", "Summarize the content in 5 bullet points.", 500, on_progress=lambda step, inc: _baseline_progress(job_id, step, inc)),
+            await _run_single_turn_case_end_to_end("sum_1000", "Summarization (1000 user tokens)", "Summarize the content in 8 bullet points.", 1000, on_progress=lambda step, inc: _baseline_progress(job_id, step, inc)),
+            await _run_single_turn_case_end_to_end("sum_2000", "Summarization (2000 user tokens)", "Summarize the content in 10 bullet points.", 2000, on_progress=lambda step, inc: _baseline_progress(job_id, step, inc)),
+        ]
+    else:
         summarization_cases = [
             await _run_single_turn_case(
                 effective_prompt,
@@ -909,39 +971,53 @@ async def _execute_baseline(job_id: str, enforce_max_response_tokens: bool, mode
             ),
         ]
 
-        multi_turn_targets = [50 + ((i * 17) % 151) for i in range(20)]
-        multi_turn_cases = [
-            await _run_multi_turn_case(
+    multi_turn_targets = [50 + ((i * 17) % 151) for i in range(20)]
+    multi_turn_cases = [
+        await (
+            _run_multi_turn_case_end_to_end(
+                case_id="mt_20x_50_200",
+                label="20-turn conversation (50-200 user tokens/turn)",
+                task_instruction="Maintain consistency across turns and preserve key decisions while answering each turn concisely.",
+                turn_targets=multi_turn_targets,
+                on_progress=lambda step, inc: _baseline_progress(job_id, step, inc),
+            )
+            if mode == "end_to_end_aigentos"
+            else _run_multi_turn_case(
                 effective_prompt,
                 case_id="mt_20x_50_200",
                 label="20-turn conversation (50-200 user tokens/turn)",
-                task_instruction=(
-                    "Maintain consistency across turns and preserve key decisions while answering each turn concisely."
-                ),
+                task_instruction="Maintain consistency across turns and preserve key decisions while answering each turn concisely.",
                 turn_targets=multi_turn_targets,
                 max_response_tokens=baseline_max_tokens,
                 on_progress=lambda step, inc: _baseline_progress(job_id, step, inc),
             )
-        ]
+        )
+    ]
 
-        extraction_cases = [
-            await _run_single_turn_case(
+    extraction_cases = [
+        await (
+            _run_single_turn_case_end_to_end(
+                case_id="extract_400",
+                label="Structured Extraction (400 user tokens)",
+                task_instruction="Extract entities into JSON with keys: people, organizations, dates, locations, and actions.",
+                input_tokens=400,
+                on_progress=lambda step, inc: _baseline_progress(job_id, step, inc),
+            )
+            if mode == "end_to_end_aigentos"
+            else _run_single_turn_case(
                 effective_prompt,
                 case_id="extract_400",
                 label="Structured Extraction (400 user tokens)",
-                task_instruction=(
-                    "Extract entities into JSON with keys: people, organizations, dates, locations, and actions."
-                ),
+                task_instruction="Extract entities into JSON with keys: people, organizations, dates, locations, and actions.",
                 input_tokens=400,
                 max_response_tokens=baseline_max_tokens,
                 on_progress=lambda step, inc: _baseline_progress(job_id, step, inc),
             )
-        ]
+        )
+    ]
 
     system_prompt_targets = [200, 500, 1000, 2000, 5000, 10000]
     system_prompt_cases: list[BaselineCaseResult] = []
-    if mode == "end_to_end_aigentos":
-        _append_baseline_event(job_id, "System Prompt Pressure uses direct model mode in 0.2.4-oss")
     for idx, target in enumerate(system_prompt_targets):
         user_tokens = 100 + ((idx * 37) % 201)
         system_prompt_cases.append(
@@ -969,7 +1045,7 @@ async def _execute_baseline(job_id: str, enforce_max_response_tokens: bool, mode
     total_calls = sum(case.calls for category in categories for case in category.cases)
     return BaselineRunResponse(
         model=settings.ollama_model,
-        mode=mode,
+        mode=mode,  # type: ignore[arg-type]
         started_at=started_at,
         completed_at=completed_at,
         duration_ms=duration_ms,
@@ -982,6 +1058,7 @@ async def _execute_baseline(job_id: str, enforce_max_response_tokens: bool, mode
 async def health() -> HealthResponse:
     return HealthResponse(
         status="ok",
+        version=settings.aigent_version,
         tenant_id=settings.aigent_tenant_id,
         model=settings.ollama_model,
         ollama_base_url=settings.ollama_base_url,
@@ -992,16 +1069,42 @@ async def health() -> HealthResponse:
 
 @app.get("/api/worker/health")
 async def worker_health() -> dict:
-    last_seen = store.get_worker_heartbeat()
-    if last_seen is None:
-        return {"status": "unknown", "last_seen": None, "message": "Worker has not reported in yet"}
-    age_seconds = (datetime.now(timezone.utc) - last_seen).total_seconds()
-    healthy = age_seconds < 30
+    def _worker_status(last_seen: datetime | None) -> dict:
+        if last_seen is None:
+            return {"status": "unknown", "last_seen": None}
+        age_seconds = (datetime.now(timezone.utc) - last_seen).total_seconds()
+        return {
+            "status": "healthy" if age_seconds < 30 else "stale",
+            "last_seen": last_seen.isoformat(),
+            "age_seconds": round(age_seconds, 1),
+        }
+
     return {
-        "status": "healthy" if healthy else "stale",
-        "last_seen": last_seen.isoformat(),
-        "age_seconds": round(age_seconds, 1),
+        "dialogue_worker": _worker_status(store.get_worker_heartbeat("dialogue-worker")),
+        "orchestrator_worker": _worker_status(store.get_worker_heartbeat("orchestrator-worker")),
     }
+
+
+def _require_workers_for_end_to_end_baseline() -> None:
+    required_workers = {
+        "dialogue-worker": store.get_worker_heartbeat("dialogue-worker"),
+        "orchestrator-worker": store.get_worker_heartbeat("orchestrator-worker"),
+    }
+    unhealthy: list[str] = []
+    now = datetime.now(timezone.utc)
+    for worker_id, last_seen in required_workers.items():
+        if last_seen is None:
+            unhealthy.append(f"{worker_id}=unknown")
+            continue
+        age_seconds = (now - last_seen).total_seconds()
+        if age_seconds >= 30:
+            unhealthy.append(f"{worker_id}=stale({round(age_seconds, 1)}s)")
+    if unhealthy:
+        joined = ", ".join(unhealthy)
+        raise RuntimeError(
+            "End-to-end AIgentOS baseline requires healthy workers. "
+            f"Current worker state: {joined}"
+        )
 
 
 @app.post("/api/llm/warmup", response_model=WarmupResponse)
@@ -1049,6 +1152,23 @@ async def delete_all_data(payload: DeleteAllDataRequest) -> DeleteAllDataRespons
     global _warmup_completed_at
     if not payload.confirm:
         raise HTTPException(status_code=400, detail="Confirmation required")
+    for item in store.list_document_imports(limit=5000):
+        try:
+            path = Path(item.stored_path)
+            if path.exists():
+                path.unlink()
+        except Exception:
+            pass
+    uploads_dir = Path(settings.uploads_dir)
+    if uploads_dir.exists():
+        for child in uploads_dir.iterdir():
+            try:
+                if child.is_file() or child.is_symlink():
+                    child.unlink()
+                elif child.is_dir():
+                    shutil.rmtree(child)
+            except Exception:
+                pass
     store.delete_all_data()
     _warmup_completed_at = None
     return DeleteAllDataResponse(ok=True, deleted_at=datetime.now(timezone.utc))
@@ -1103,7 +1223,10 @@ async def update_context_settings(payload: ContextSettingsUpdateRequest) -> Cont
 async def list_memory_chunks(limit: int = 200) -> MemoryChunkListResponse:
     safe_limit = max(1, min(limit, 1000))
     context = _get_context_settings()
-    chunks = store.list_rag_chunks(limit=safe_limit)
+    chunks = store.list_rag_chunks(
+        limit=safe_limit,
+        source_types=["interaction_event", "turn_memory", "memory_summary"],
+    )
     return MemoryChunkListResponse(
         memory_enabled=context.memory_enabled,
         chunks=[
@@ -1126,6 +1249,231 @@ async def delete_memory_chunk(chunk_id: str) -> Response:
     ok = store.delete_rag_chunk(chunk_id)
     if not ok:
         raise HTTPException(status_code=404, detail="Memory chunk not found")
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@app.post("/api/imports", response_model=DocumentImportResponse, status_code=status.HTTP_202_ACCEPTED)
+async def import_document(
+    file: UploadFile = File(...),
+    conversation_id: str | None = Form(default=None),
+) -> DocumentImportResponse:
+    if conversation_id and not store.ensure_conversation(conversation_id):
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    _MAX_UPLOAD_BYTES = 50 * 1024 * 1024  # 50 MB
+    data = await file.read(_MAX_UPLOAD_BYTES + 1)
+    if len(data) > _MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="File too large (max 50 MB)")
+    request_event = None
+    if conversation_id:
+        request_event = store.create_interaction_event(
+            conversation_id,
+            "user",
+            _import_request_message(file.filename or "upload"),
+            status="completed",
+            event_type="document_import_request",
+        )
+    file_hash = hashlib.sha256(data).hexdigest()
+    existing = store.find_document_import_by_hash(file_hash=file_hash, conversation_id=conversation_id)
+    if existing is not None:
+        if conversation_id:
+            store.create_interaction_event(
+                conversation_id,
+                "assistant",
+                _reused_import_ack_message(existing.filename, existing.status),
+                status="completed",
+                causation_event_id=request_event.id if request_event else None,
+            )
+        return DocumentImportResponse(
+            id=existing.id,
+            conversation_id=existing.conversation_id,
+            filename=existing.filename,
+            media_type=existing.media_type,
+            reused_existing=True,
+            status=existing.status,  # type: ignore[arg-type]
+            created_at=existing.created_at,
+            processed_at=existing.processed_at,
+            error=existing.error,
+        )
+    uploads_dir = Path(settings.uploads_dir)
+    uploads_dir.mkdir(parents=True, exist_ok=True)
+    suffix = Path(file.filename or "upload").suffix
+    stored_name = f"{uuid.uuid4()}{suffix}"
+    stored_path = uploads_dir / stored_name
+    stored_path.write_bytes(data)
+    document = store.create_document_import(
+        filename=file.filename or stored_name,
+        media_type=file.content_type or "application/octet-stream",
+        stored_path=str(stored_path),
+        conversation_id=conversation_id,
+        file_hash=file_hash,
+    )
+    store.create_orchestration_event(
+        event_type="document_import",
+        label="Importing document",
+        detail=f"{document.filename}",
+        status="pending",
+        conversation_id=conversation_id,
+        parent_event_id=request_event.id if request_event else None,
+        document_id=document.id,
+        payload={"document_id": document.id},
+    )
+    return DocumentImportResponse(
+        id=document.id,
+        conversation_id=document.conversation_id,
+        filename=document.filename,
+        media_type=document.media_type,
+        reused_existing=False,
+        status=document.status,  # type: ignore[arg-type]
+        created_at=document.created_at,
+        processed_at=document.processed_at,
+        error=document.error,
+    )
+
+
+@app.get("/api/imports", response_model=list[DocumentImportResponse])
+async def list_document_imports(limit: int = 200) -> list[DocumentImportResponse]:
+    safe_limit = max(1, min(limit, 1000))
+    rows = store.list_document_imports(limit=safe_limit)
+    return [
+        DocumentImportResponse(
+            id=row.id,
+            conversation_id=row.conversation_id,
+            filename=row.filename,
+            media_type=row.media_type,
+            reused_existing=False,
+            status=row.status,  # type: ignore[arg-type]
+            created_at=row.created_at,
+            processed_at=row.processed_at,
+            error=row.error,
+        )
+        for row in rows
+    ]
+
+
+@app.get("/api/imports/{document_id}", response_model=DocumentImportResponse)
+async def get_document_import(document_id: str) -> DocumentImportResponse:
+    row = store.get_document_import(document_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Document import not found")
+    return DocumentImportResponse(
+        id=row.id,
+        conversation_id=row.conversation_id,
+        filename=row.filename,
+        media_type=row.media_type,
+        reused_existing=False,
+        status=row.status,  # type: ignore[arg-type]
+        created_at=row.created_at,
+        processed_at=row.processed_at,
+        error=row.error,
+    )
+
+
+@app.delete("/api/imports/{document_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_document_import(document_id: str) -> Response:
+    row = store.get_document_import(document_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Document import not found")
+    try:
+        path = Path(row.stored_path)
+        if path.exists():
+            path.unlink()
+    except Exception:
+        pass
+    deleted = store.delete_document_import(document_id)
+    if deleted is None:
+        raise HTTPException(status_code=404, detail="Document import not found")
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@app.get("/api/mcp/servers", response_model=list[McpServerResponse])
+async def list_mcp_servers() -> list[McpServerResponse]:
+    return [_mcp_server_response(server) for server in store.list_mcp_servers()]
+
+
+@app.post("/api/mcp/servers", response_model=McpServerResponse, status_code=status.HTTP_201_CREATED)
+async def create_mcp_server(payload: McpServerCreateRequest) -> McpServerResponse:
+    if payload.transport == "stdio" and not (payload.command or "").strip():
+        raise HTTPException(status_code=400, detail="Stdio MCP servers require a command")
+    if payload.transport == "streamable_http" and not (payload.url or "").strip():
+        raise HTTPException(status_code=400, detail="HTTP MCP servers require a URL")
+    server = store.create_mcp_server(
+        name=payload.name.strip(),
+        transport=payload.transport,
+        command=(payload.command or "").strip() or None,
+        args=[str(item) for item in payload.args],
+        url=(payload.url or "").strip() or None,
+        env={str(k): str(v) for k, v in payload.env.items()},
+        enabled=payload.enabled,
+    )
+    return _mcp_server_response(server)
+
+
+@app.patch("/api/mcp/servers/{server_id}", response_model=McpServerResponse)
+async def update_mcp_server(server_id: str, payload: McpServerUpdateRequest) -> McpServerResponse:
+    current = store.get_mcp_server(server_id)
+    if current is None:
+        raise HTTPException(status_code=404, detail="MCP server not found")
+    if _is_managed_mcp_server(current):
+        raise HTTPException(status_code=403, detail="This MCP server is managed by AIgentOS and cannot be edited here")
+    next_command = payload.command.strip() if isinstance(payload.command, str) else payload.command
+    next_url = payload.url.strip() if isinstance(payload.url, str) else payload.url
+    effective_command = next_command if payload.command is not None else current.command
+    effective_url = next_url if payload.url is not None else current.url
+    if current.transport == "stdio" and not (effective_command or "").strip():
+        raise HTTPException(status_code=400, detail="Stdio MCP servers require a command")
+    if current.transport == "streamable_http" and not (effective_url or "").strip():
+        raise HTTPException(status_code=400, detail="HTTP MCP servers require a URL")
+    server = store.update_mcp_server(
+        server_id,
+        name=payload.name.strip() if payload.name is not None else None,
+        command=next_command,
+        args=[str(item) for item in payload.args] if payload.args is not None else None,
+        url=next_url,
+        env={str(k): str(v) for k, v in payload.env.items()} if payload.env is not None else None,
+        enabled=payload.enabled,
+    )
+    if server is None:
+        raise HTTPException(status_code=404, detail="MCP server not found")
+    return _mcp_server_response(server)
+
+
+@app.post("/api/mcp/servers/{server_id}/refresh", response_model=McpServerResponse)
+async def refresh_mcp_server(server_id: str) -> McpServerResponse:
+    server = store.get_mcp_server(server_id)
+    if server is None:
+        raise HTTPException(status_code=404, detail="MCP server not found")
+    if not server.enabled:
+        server = store.set_mcp_server_discovery_result(server.id, discovered_tools=[], status="disabled", last_error=None)
+        if server is None:
+            raise HTTPException(status_code=404, detail="MCP server not found")
+        return _mcp_server_response(server)
+    try:
+        tools = await discover_mcp_tools(
+            {
+                "transport": server.transport,
+                "command": server.command,
+                "args": server.args,
+                "url": server.url,
+                "env": server.env,
+            }
+        )
+        updated = store.set_mcp_server_discovery_result(server.id, discovered_tools=tools, status="connected", last_error=None)
+    except McpClientError as exc:
+        updated = store.set_mcp_server_error(server.id, error=str(exc), status="error")
+    if updated is None:
+        raise HTTPException(status_code=404, detail="MCP server not found")
+    return _mcp_server_response(updated)
+
+
+@app.delete("/api/mcp/servers/{server_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_mcp_server(server_id: str) -> Response:
+    server = store.get_mcp_server(server_id)
+    if server is None:
+        raise HTTPException(status_code=404, detail="MCP server not found")
+    if _is_managed_mcp_server(server):
+        raise HTTPException(status_code=403, detail="This MCP server is managed by AIgentOS and cannot be removed here")
+    if not store.delete_mcp_server(server_id):
+        raise HTTPException(status_code=404, detail="MCP server not found")
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
@@ -1158,6 +1506,24 @@ async def get_prompt_components() -> list[PromptComponentResponse]:
                 enabled=item.enabled,
                 is_system=item.is_system,
             is_custom=item.id in overrides,
+        )
+        for item in components
+    ]
+
+
+@app.get("/api/prompts/orchestrator", response_model=list[PromptComponentResponse])
+async def get_orchestrator_prompts() -> list[PromptComponentResponse]:
+    components = load_orchestrator_prompts(repo_root=repo_root)
+    return [
+        PromptComponentResponse(
+            id=item.id,
+            name=item.name,
+            file_path=item.file_path,
+            content=item.content,
+            order=item.order,
+            enabled=item.enabled,
+            is_system=item.is_system,
+            is_custom=False,
         )
         for item in components
     ]
@@ -1284,11 +1650,24 @@ async def get_conversation_events(conversation_id: str) -> ConversationEventsRes
         raise HTTPException(status_code=404, detail="Conversation not found")
     title, updated_at, _ = detail
     events = store.get_conversation_events(conversation_id)
+    background_updates = store.list_conversation_orchestration_events(conversation_id, limit=40)
     return ConversationEventsResponse(
         id=conversation_id,
         title=title,
         updated_at=updated_at,
         events=[_event_to_response(event) for event in events],
+        background_updates=[
+            BackgroundUpdateResponse(
+                id=item.id,
+                label=item.label,
+                status=item.status,  # type: ignore[arg-type]
+                message=item.label,
+                detail=item.detail,
+                payload=item.payload or None,
+                timestamp=item.created_at,
+            )
+            for item in reversed(background_updates)
+        ],
     )
 
 
@@ -1357,6 +1736,11 @@ async def recent_performance(limit: int = 5) -> list[PerformanceExchange]:
                 prompt_tokens=row.prompt_tokens,
                 completion_tokens=row.completion_tokens,
                 total_tokens=row.total_tokens,
+                response_source=row.response_source,
+                response_policy=row.response_policy,
+                llm_involved=row.llm_involved,
+                tool_observations=row.tool_observations,
+                workflow_trace=row.workflow_trace,
                 prompt_breakdown=PromptBreakdown(
                     system_chars=row.system_chars,
                     user_chars=row.user_chars,
@@ -1415,6 +1799,8 @@ async def _run_baseline_background(job_id: str) -> None:
 @app.post("/api/baseline/start", response_model=BaselineJobStartResponse)
 async def start_baseline(payload: BaselineStartRequest | None = None) -> BaselineJobStartResponse:
     payload = payload or BaselineStartRequest()
+    if payload.mode == "end_to_end_aigentos":
+        _require_workers_for_end_to_end_baseline()
     job_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc)
     _baseline_jobs[job_id] = {
@@ -1433,10 +1819,7 @@ async def start_baseline(payload: BaselineStartRequest | None = None) -> Baselin
         "enforce_max_response_tokens": payload.enforce_max_response_tokens,
         "mode": payload.mode,
     }
-    _append_baseline_event(
-        job_id,
-        f"Baseline mode: {'End-to-end AIgentOS' if payload.mode == 'end_to_end_aigentos' else 'Direct model'}",
-    )
+    _append_baseline_event(job_id, f"Baseline mode: {payload.mode}")
     if payload.enforce_max_response_tokens:
         _append_baseline_event(job_id, "Mode: enforcing max response tokens")
     else:
@@ -1455,6 +1838,8 @@ async def baseline_status(job_id: str) -> BaselineJobStatusResponse:
 @app.post("/api/baseline/run", response_model=BaselineRunResponse)
 async def run_baseline(payload: BaselineStartRequest | None = None) -> BaselineRunResponse:
     payload = payload or BaselineStartRequest()
+    if payload.mode == "end_to_end_aigentos":
+        _require_workers_for_end_to_end_baseline()
     job_id = f"direct-{uuid.uuid4()}"
     now = datetime.now(timezone.utc)
     _baseline_jobs[job_id] = {
@@ -1473,10 +1858,7 @@ async def run_baseline(payload: BaselineStartRequest | None = None) -> BaselineR
         "enforce_max_response_tokens": payload.enforce_max_response_tokens,
         "mode": payload.mode,
     }
-    _append_baseline_event(
-        job_id,
-        f"Baseline mode: {'End-to-end AIgentOS' if payload.mode == 'end_to_end_aigentos' else 'Direct model'}",
-    )
+    _append_baseline_event(job_id, f"Baseline mode: {payload.mode}")
     if payload.enforce_max_response_tokens:
         _append_baseline_event(job_id, "Mode: enforcing max response tokens")
     else:
@@ -1518,6 +1900,11 @@ async def debug_logs(limit: int = 50) -> list[DebugLogResponse]:
                         "prompt_tokens": row.prompt_tokens,
                         "completion_tokens": row.completion_tokens,
                         "total_tokens": row.total_tokens,
+                        "response_source": row.response_source,
+                        "response_policy": row.response_policy,
+                        "llm_involved": row.llm_involved,
+                        "tool_observations": row.tool_observations,
+                        "workflow_trace": row.workflow_trace,
                         "retrieved_chunk_count": row.retrieved_chunk_count,
                         "retrieved_chunks": [
                             {
@@ -1561,6 +1948,15 @@ async def chat(payload: ChatRequest) -> ChatAcceptedResponse:
         role="user",
         content=payload.message,
         status="pending",
+    )
+    store.create_orchestration_event(
+        event_type="prepare_turn",
+        label="Searching memory",
+        detail="Queued background orchestration for this turn",
+        status="pending",
+        conversation_id=conversation_id,
+        parent_event_id=user_event.id,
+        payload={"user_message": payload.message},
     )
     store.maybe_set_title_from_message(conversation_id, payload.message)
     return ChatAcceptedResponse(

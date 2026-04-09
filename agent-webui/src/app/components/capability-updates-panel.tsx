@@ -1,17 +1,19 @@
 import { useEffect, useRef } from 'react';
-import { ChevronLeft, ChevronRight, Calendar, Cloud, CheckCircle2, AlertCircle, Clock } from 'lucide-react';
+import { ChevronLeft, ChevronRight, CheckCircle2, AlertCircle, Clock } from 'lucide-react';
 
-interface CapabilityUpdate {
+interface BackgroundUpdate {
   id: string;
-  capabilityName: string;
+  label: string;
   status: 'success' | 'error' | 'processing';
   message: string;
   timestamp: string;
+  detail?: string;
+  payload?: Record<string, unknown> | null;
   icon?: React.ReactNode;
 }
 
 interface CapabilityUpdatesPanelProps {
-  updates: CapabilityUpdate[];
+  updates: BackgroundUpdate[];
   isCollapsed: boolean;
   onToggleCollapse: () => void;
 }
@@ -46,7 +48,7 @@ export function CapabilityUpdatesPanel({
         <button
           onClick={onToggleCollapse}
           className="p-2 rounded-lg transition-colors hover:bg-opacity-5 hover:bg-black"
-          aria-label="Expand updates panel"
+          aria-label="Expand background work panel"
         >
           <ChevronLeft className="w-5 h-5" style={{ color: 'var(--aigent-color-text-muted)' }} />
         </button>
@@ -70,12 +72,12 @@ export function CapabilityUpdatesPanel({
     >
       <div className="flex items-center justify-between p-4 border-b" style={{ borderColor: 'var(--aigent-color-border)' }}>
         <h3 className="font-medium m-0" style={{ color: 'var(--aigent-color-text)' }}>
-          Agent Updates
+          Background Work
         </h3>
         <button
           onClick={onToggleCollapse}
           className="p-1.5 rounded-lg transition-colors hover:bg-opacity-5 hover:bg-black"
-          aria-label="Collapse updates panel"
+          aria-label="Collapse background work panel"
         >
           <ChevronRight className="w-4 h-4" style={{ color: 'var(--aigent-color-text-muted)' }} />
         </button>
@@ -89,7 +91,7 @@ export function CapabilityUpdatesPanel({
               style={{ color: 'var(--aigent-color-text-muted)' }} 
             />
             <p className="text-sm" style={{ color: 'var(--aigent-color-text-muted)' }}>
-              No recent updates
+              No recent background work
             </p>
           </div>
         ) : (
@@ -107,12 +109,17 @@ export function CapabilityUpdatesPanel({
                 <div className="flex-1 min-w-0">
                   <div className="flex items-center gap-2 mb-1">
                     <span className="font-medium text-sm" style={{ color: 'var(--aigent-color-text)' }}>
-                      {update.capabilityName}
+                      {update.label}
                     </span>
                   </div>
                   <p className="text-sm" style={{ color: 'var(--aigent-color-text-muted)' }}>
                     {update.message}
                   </p>
+                  {update.detail && (
+                    <p className="text-xs mt-1" style={{ color: 'var(--aigent-color-text-muted)' }}>
+                      {update.detail}
+                    </p>
+                  )}
                 </div>
               </div>
               <div className="flex items-center justify-between mt-2">

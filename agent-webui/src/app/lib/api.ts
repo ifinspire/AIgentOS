@@ -42,12 +42,23 @@ export interface ApiConversationEventsResponse {
   title: string;
   updated_at: string;
   events: ApiInteractionEvent[];
+  background_updates?: ApiBackgroundUpdate[];
 }
 
 export interface ApiChatAcceptedResponse {
   conversation_id: string;
   event_id: string;
   accepted_at: string;
+}
+
+export interface ApiBackgroundUpdate {
+  id: string;
+  label: string;
+  status: "pending" | "processing" | "completed" | "failed";
+  message: string;
+  detail: string | null;
+  payload: Record<string, unknown> | null;
+  timestamp: string;
 }
 
 export interface ApiPromptBreakdown {
@@ -66,6 +77,11 @@ export interface ApiPerformanceMetrics {
   prompt_tokens: number | null;
   completion_tokens: number | null;
   total_tokens: number | null;
+  response_source: string | null;
+  response_policy: string | null;
+  llm_involved: boolean;
+  tool_observations: Record<string, unknown>[];
+  workflow_trace: Record<string, unknown>[];
   retrieved_chunk_count: number;
   retrieved_chunks: ApiRetrievedChunk[];
   prompt_breakdown: ApiPromptBreakdown;
@@ -173,6 +189,34 @@ export interface ApiMemoryChunkListResponse {
   chunks: ApiMemoryChunk[];
 }
 
+export interface ApiDocumentImport {
+  id: string;
+  conversation_id: string | null;
+  filename: string;
+  media_type: string;
+  reused_existing?: boolean;
+  status: "pending" | "processing" | "completed" | "failed";
+  created_at: string;
+  processed_at: string | null;
+  error: string | null;
+}
+
+export interface ApiMcpServer {
+  id: string;
+  name: string;
+  transport: "stdio" | "streamable_http";
+  command: string | null;
+  args: string[];
+  url: string | null;
+  env: Record<string, string>;
+  enabled: boolean;
+  status: string;
+  last_error: string | null;
+  discovered_tools: { name: string; description?: string; inputSchema?: Record<string, unknown> }[];
+  created_at: string;
+  updated_at: string;
+}
+
 export interface ApiWarmupResponse {
   ok: boolean;
   status: string;
@@ -277,7 +321,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
 export const api = {
   async healthCheck() {
-    return request<{ status: "ok"; tenant_id: string; model: string; ollama_base_url: string; embedding_base_url: string; is_warm: boolean }>("/health");
+    return request<{ status: "ok"; version: string; tenant_id: string; model: string; ollama_base_url: string; embedding_base_url: string; is_warm: boolean }>("/health");
   },
 
   async listConversations() {
@@ -313,6 +357,89 @@ export const api = {
     });
   },
 
+  async importDocument(file: File, conversationId?: string) {
+    const form = new FormData();
+    form.append("file", file);
+    if (conversationId) {
+      form.append("conversation_id", conversationId);
+    }
+    const response = await fetch(`${API_BASE_URL}/api/imports`, {
+      method: "POST",
+      body: form,
+    });
+    if (!response.ok) {
+      let detail = response.statusText;
+      try {
+        const data = await response.json();
+        detail = data?.detail || detail;
+      } catch {
+        // Keep status text fallback.
+      }
+      throw new Error(detail);
+    }
+    return response.json() as Promise<ApiDocumentImport>;
+  },
+
+  async getDocumentImport(documentId: string) {
+    return request<ApiDocumentImport>(`/api/imports/${documentId}`);
+  },
+
+  async getDocumentImports(limit = 200) {
+    return request<ApiDocumentImport[]>(`/api/imports?limit=${limit}`);
+  },
+
+  async deleteDocumentImport(documentId: string) {
+    await request<null>(`/api/imports/${documentId}`, {
+      method: "DELETE",
+    });
+  },
+
+  async listMcpServers() {
+    return request<ApiMcpServer[]>("/api/mcp/servers");
+  },
+
+  async createMcpServer(payload: {
+    name: string;
+    transport: "stdio" | "streamable_http";
+    command?: string | null;
+    args?: string[];
+    url?: string | null;
+    env?: Record<string, string>;
+    enabled?: boolean;
+  }) {
+    return request<ApiMcpServer>("/api/mcp/servers", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+  },
+
+  async updateMcpServer(serverId: string, payload: {
+    name?: string;
+    command?: string | null;
+    args?: string[];
+    url?: string | null;
+    env?: Record<string, string>;
+    enabled?: boolean;
+  }) {
+    return request<ApiMcpServer>(`/api/mcp/servers/${serverId}`, {
+      method: "PATCH",
+      body: JSON.stringify(payload),
+    });
+  },
+
+  async refreshMcpServer(serverId: string) {
+    return request<ApiMcpServer>(`/api/mcp/servers/${serverId}/refresh`, {
+      method: "POST",
+      body: JSON.stringify({}),
+    });
+  },
+
+  async deleteMcpServer(serverId: string) {
+    await request<null>(`/api/mcp/servers/${serverId}`, {
+      method: "DELETE",
+    });
+  },
+
   async deleteConversation(conversationId: string) {
     await request<null>(`/api/conversations/${conversationId}`, {
       method: "DELETE",
@@ -329,6 +456,10 @@ export const api = {
 
   async getPromptComponents() {
     return request<ApiPromptComponent[]>("/api/prompts/components");
+  },
+
+  async getOrchestratorPrompts() {
+    return request<ApiPromptComponent[]>("/api/prompts/orchestrator");
   },
 
   async updatePromptComponent(componentId: string, payload: { content?: string; enabled?: boolean }) {
@@ -423,14 +554,14 @@ export const api = {
   async runBaseline(payload?: ApiBaselineStartRequest) {
     return request<ApiBaselineRunResponse>("/api/baseline/run", {
       method: "POST",
-      body: JSON.stringify(payload ?? { enforce_max_response_tokens: true, mode: "direct_model" }),
+      body: JSON.stringify(payload ?? { enforce_max_response_tokens: true }),
     });
   },
 
   async startBaseline(payload?: ApiBaselineStartRequest) {
     return request<ApiBaselineJobStartResponse>("/api/baseline/start", {
       method: "POST",
-      body: JSON.stringify(payload ?? { enforce_max_response_tokens: true, mode: "direct_model" }),
+      body: JSON.stringify(payload ?? { enforce_max_response_tokens: true }),
     });
   },
 

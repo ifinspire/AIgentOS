@@ -1,6 +1,10 @@
 services:
   kernel:
     build: .
+    restart: unless-stopped
+    depends_on:
+      markitdown-mcp:
+        condition: service_healthy
     ports:
       - "${HOST_PORT_KERNEL:-5501}:8000"
     env_file:
@@ -11,9 +15,13 @@ services:
       - ./agent-prompts:/app/agent-prompts
       - ./baseline:/app/baseline
 
+  # dialogue-worker does not depend on markitdown-mcp — intentional.
+  # It only reads from the shared SQLite DB; document conversion and MCP
+  # tool calls are the orchestrator-worker's responsibility.
   dialogue-worker:
     build: .
     command: python -m kernel.workers.dialogue_worker
+    restart: unless-stopped
     env_file:
       - path: .env
         required: false
@@ -22,10 +30,43 @@ services:
       - ./agent-prompts:/app/agent-prompts
       - ./baseline:/app/baseline
 
+  orchestrator-worker:
+    build: .
+    command: python -m kernel.workers.orchestrator_worker
+    restart: unless-stopped
+    depends_on:
+      markitdown-mcp:
+        condition: service_healthy
+    env_file:
+      - path: .env
+        required: false
+    volumes:
+      - ./models-local:/app/models-local
+      - ./agent-prompts:/app/agent-prompts
+      - ./baseline:/app/baseline
+
+  markitdown-mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile.markitdown-mcp
+    restart: unless-stopped
+    volumes:
+      - ./models-local/uploads:/data/uploads:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; s=socket.create_connection(('127.0.0.1', 3001), 2); s.close()"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 3s
+
   webui:
     image: node:20-alpine
     working_dir: /app
     command: sh -c "npm ci --include=dev --no-audit --no-fund && npm run dev:docker"
+    restart: unless-stopped
+    depends_on:
+      kernel:
+        condition: service_started
     ports:
       - "${HOST_PORT_WEBUI:-5500}:3000"
     environment:

@@ -1,5 +1,5 @@
 import { useState, KeyboardEvent, useRef, useEffect } from 'react';
-import { Send, Loader2 } from 'lucide-react';
+import { Send, Loader2, Paperclip } from 'lucide-react';
 
 interface InputAreaProps {
   onSend: (message: string) => void;
@@ -15,6 +15,8 @@ interface InputAreaProps {
     exceeds: boolean;
     includesCompactInstructions: boolean;
   };
+  onAttach?: (file: File) => void;
+  attachedFileName?: string | null;
 }
 
 export function InputArea({ 
@@ -25,6 +27,8 @@ export function InputArea({
   resetSignal = 0,
   validateMessage,
   getUsage,
+  onAttach,
+  attachedFileName,
 }: InputAreaProps) {
   const [message, setMessage] = useState('');
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
@@ -36,6 +40,7 @@ export function InputArea({
     includesCompactInstructions: boolean;
   } | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
     const el = textareaRef.current;
@@ -117,6 +122,32 @@ export function InputArea({
           border: '1px solid var(--aigent-color-border)'
         }}
       >
+        <input
+          ref={fileInputRef}
+          type="file"
+          className="hidden"
+          onChange={(e) => {
+            const file = e.target.files?.[0];
+            if (file && onAttach) {
+              onAttach(file);
+            }
+            e.currentTarget.value = '';
+          }}
+        />
+        <button
+          type="button"
+          onClick={() => fileInputRef.current?.click()}
+          disabled={disabled || isProcessing || !onAttach}
+          className="flex-shrink-0 p-2 rounded-lg transition-all disabled:opacity-40 disabled:cursor-not-allowed"
+          style={{
+            backgroundColor: 'var(--aigent-color-surface)',
+            color: 'var(--aigent-color-text-muted)',
+            border: '1px solid var(--aigent-color-border)'
+          }}
+          aria-label="Attach document"
+        >
+          <Paperclip className="w-5 h-5" />
+        </button>
         <textarea
           ref={textareaRef}
           value={message}
@@ -151,7 +182,8 @@ export function InputArea({
       </div>
       {usage && (
         <p className="mt-2 text-xs" style={{ color: usage.exceeds ? 'var(--aigent-color-rfi-accent)' : 'var(--aigent-color-text-muted)' }}>
-          Prompt est: {usage.estimatedTokens} / {usage.maxContext} ({usage.pct}%){usage.includesCompactInstructions ? " · compact-instructions included" : ""}
+          Prompt est: {usage.estimatedTokens} / {usage.maxContext} ({usage.pct}%)
+          {usage.includesCompactInstructions ? " · compact-instructions included" : ""}
         </p>
       )}
       {errorMessage && (

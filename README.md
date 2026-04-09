@@ -28,12 +28,13 @@ This repository currently ships:
 - A FastAPI-based kernel (`/kernel`) with Ollama chat integration
 - Async dialogue worker that processes messages in the background with real-time streaming via SSE
 - Lightweight conversation memory backed by SQLite chunk storage and semantic retrieval (embedding-based)
+- Packaged MCP support, including a bundled `MarkItDown MCP` example for document import
 - Prompt component/profile management (`/agent-prompts`)
 - Local SQLite conversation and event storage in `/models-local/chat.db`
 - Performance/debug API surfaces with TTFT tracking, token breakdowns, and baseline benchmarking
 - A Vite/React WebUI (`/agent-webui`) as an optional interface
 
-Current release line: `v0.2.4-oss`
+Current release line: `v0.3.0-oss`
 
 ## Why One Repo (for now)
 
@@ -61,11 +62,11 @@ Always validate model and dataset terms for your own deployment and jurisdiction
 .
 ├── kernel/              # Kernel API and orchestration logic
 │   ├── api/             # FastAPI endpoints, storage, LLM client, models
-│   ├── workers/         # Background dialogue worker
+│   ├── workers/         # Background workers (dialogue, orchestrator)
 │   └── shared/          # Shared utilities (text processing, token metrics)
 ├── agent-prompts/       # Prompt bundle + components (default agent profile)
 ├── agent-webui/         # Optional WebUI client
-├── models-local/        # Local runtime data (e.g., SQLite chat DB)
+├── models-local/        # Local runtime data (e.g., SQLite chat DB, uploads)
 ├── docker-compose.yml
 └── LICENSE
 ```
@@ -82,6 +83,8 @@ Always validate model and dataset terms for your own deployment and jurisdiction
 docker compose up -d
 ```
 
+This starts the kernel, dialogue worker, orchestrator worker, WebUI, and the bundled `markitdown-mcp` service used for document import.
+
 Default endpoints:
 - WebUI: `http://localhost:5500`
 - Kernel API: `http://localhost:5501`
@@ -96,12 +99,14 @@ docker compose up -d kernel
 
 Current kernel endpoints include:
 - `GET /health`
-- `GET /api/worker/health` — dialogue worker heartbeat status
+- `GET /api/worker/health` — dialogue and orchestrator worker heartbeat status
 - `POST /api/chat`
 - `POST /api/llm/warmup`
 - `GET /api/conversations/{id}/stream` — SSE stream for real-time event updates
 - Conversation CRUD under `/api/conversations`
 - Memory management under `/api/memory/chunks`
+- Document import under `/api/imports`
+- MCP server management under `/api/mcp/servers`
 - Prompt settings/profiles/components under `/api/prompts/*`
 - Performance/debug surfaces under `/api/performance/*` and `/api/debug/logs`
 - Baseline benchmarking under `/api/baseline/*`
@@ -118,34 +123,75 @@ Current kernel endpoints include:
 
 ## Architecture Notes
 
-- **Shared utilities** live in `kernel/shared/` (text processing, token estimation). Both the kernel API and the dialogue worker import from here to avoid duplication.
+- **Shared utilities** live in `kernel/shared/` (text processing, token estimation). Both the kernel API and the workers import from here to avoid duplication.
+- **Two background workers run independently**:
+  - The **dialogue worker** owns direct-dialogue turns and RAG retrieval. It only runs after the orchestrator has explicitly routed a turn to `direct_dialogue`.
+  - The **orchestrator worker** makes an LLM routing call to decide whether a turn should go to dialogue or to a tool/subagent path (routing prompt: `agent-prompts/orchestrator/routing.md`). Tool-routed turns are completed by the orchestrator; post-turn, it selects durable memory candidates and runs compaction. Document import is also handled here through MCP.
+- **Routing vs planning are intentionally separate**:
+  - the orchestrator is currently a routing layer, not a full planner
+  - it decides whether to use dialogue, a native tool/subagent, or an MCP tool
+  - once a route is selected, the chosen tool path is responsible for planning its own work
+  - example: `math_subagent` is responsible for turning a word problem into a deterministic expression; the orchestrator only decides whether math should be invoked
+- **Known OSS limitation**: tool execution is deterministic once invoked, but tool-specific planning quality still depends on the small local model backing the selected subagent/tool prompt. In practice, this means tool calling can be structurally correct while still producing a weak plan or wrong expression.
+- **Observed performance tradeoff**:
+  - `v0.2.0` async RAG stays relatively close to the base model because memory retrieval is lightweight and the chat path remains simple
+  - `v0.3.0` async orchestration adds real control-plane cost because a turn may now require routing, subagent planning, and tool execution before the assistant can respond
+  - even with streaming, richer tool use makes the system feel meaningfully slower than plain async chat
+  - on local hardware, that extra orchestration cost is not just a latency issue; it also increases sustained load, heat, fan activity, and battery/energy usage
+  - this tradeoff is one of the clearest reasons the broader OSCAR architecture exists: once tool use becomes central, naive orchestration is too expensive unless the system separates fast-path interaction from heavier background capability work much more deliberately
+- **Why v0.4.0 exists**:
+  - `v0.2.0` proves that async RAG can preserve a chat-like feel
+  - `v0.3.0` proves that richer capability layers are valuable but expensive
+  - the `v0.4.0` direction is therefore not simply "more features"; it is "why not both?" — keep the responsiveness of `v0.2.0`, keep the capability ambitions of `v0.3.0`, and move more work into a less blocking async architecture so the fast path stays fast
+- **Tool boundary** is intentionally split:
+  - native tools remain in-kernel when they are core, deterministic, and lightweight enough to justify hard guarantees
+  - MCP tools are used for replaceable external capabilities
+  - in the current OSS baseline, **math stays native** and **document import is powered by MarkItDown MCP**
+- **Packaged MCP example**: document conversion runs through a dedicated `markitdown-mcp` service. AIgentOS stores the uploaded file locally, calls MarkItDown over MCP, then chunks and embeds the returned Markdown.
+- **Attribution**: the bundled document-conversion example is powered by [Microsoft MarkItDown](https://github.com/microsoft/markitdown).
 - **Token estimation** currently uses a `char_count / 4` heuristic. This is a known approximation; future versions may use Ollama's `/api/tokenize` endpoint for accuracy.
 - **RAG retrieval** computes cosine similarity against all stored memory chunks. This is acceptable at the default chunk limit (160) but will not scale to thousands of chunks without indexing.
 - **SSE streaming** (`/api/conversations/{id}/stream`) includes an idle timeout (~5 minutes) and handles client disconnection gracefully.
-- **Worker health** is tracked via a heartbeat written to the database each poll cycle. The kernel exposes `GET /api/worker/health` to check if the dialogue worker is alive.
+- **Worker health** is tracked via per-worker heartbeats written to the database each poll cycle. `GET /api/worker/health` reports status for both `dialogue_worker` and `orchestrator_worker`.
 
 ## Baseline Perf Data
 
 Baseline runs are tracked in `/baseline/perf/` (timestamped markdown reports).
+
+The baseline system supports two modes:
+- **Direct model**: benchmarks the raw prompt → LLM → response path (what v0.2.0 and v0.1.0 measured)
+- **End-to-end AIgentOS**: benchmarks the real product path — `POST /api/chat` → workers → assistant event completion — the same flow a user experiences when sending a message
 
 Benchmark environment:
 - Apple M3 Pro
 - 18 GB RAM
 - macOS Tahoe 26.3
 
-### v0.2.4-oss SQLite Hardening + End-to-End Baseline (2026-04-08)
+### v0.3.0-oss End-to-End Baseline (2026-04-08)
 
-v0.2.4-oss includes:
-- stronger SQLite reset and recovery behavior for the local chat store
-- the direct-vs-E2E baseline split introduced in `v0.2.3-oss`
+5 E2E runs on `alibayram/smollm3` with `max_response_tokens=1024`. v0.3.0 E2E measures the full orchestrator + dialogue worker stack: `POST /api/chat` → orchestrator routing LLM call → optional tool dispatch → dialogue worker → assistant event completion.
 
-The baseline mode toggle provides:
-- **Direct model**: benchmarks the raw prompt → LLM → response path (what v0.2.0 and v0.1.0 measured)
-- **End-to-end AIgentOS**: benchmarks the real product path — `POST /api/chat` → async dialogue worker → assistant event completion — the same flow a user experiences when sending a message
+| Report | Mode | Completed (local) | Duration | Simple Q/A min-max | Summarization min-max | 20-turn per-turn min-max | Structured extraction | System prompt pressure min-max | TTFT min-max | 20-turn tok/s |
+|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| [baseline-0_3_0-e2e-20260408-213446.md](baseline/perf/baseline-0_3_0-e2e-20260408-213446.md) | E2E | 2026-04-08 21:34:21 | 452.6s | 4.90s-12.74s | 8.60s-18.57s | 10.21s-22.55s | 10.28s | 1.50s-15.49s | 619ms-20.25s | 5.1-11.4 |
+| [baseline-0_3_0-e2e-20260408-230141.md](baseline/perf/baseline-0_3_0-e2e-20260408-230141.md) | E2E | 2026-04-08 22:05:09 | 559.1s | 5.77s-8.23s | 8.48s-19.07s | 15.07s-28.52s | 11.36s | 2.68s-13.31s | 881ms-24.29s | 7.0-17.6 |
+| [baseline-0_3_0-e2e-20260408-235119.md](baseline/perf/baseline-0_3_0-e2e-20260408-235119.md) | E2E | 2026-04-08 23:46:05 | 367.9s | 10.01s-22.87s | 9.66s-17.86s | 6.58s-15.02s | 10.76s | 2.69s-13.46s | 613ms-13.83s | 0.5-1.9 |
+| [baseline-0_3_0-e2e-20260409-004240.md](baseline/perf/baseline-0_3_0-e2e-20260409-004240.md) | E2E | 2026-04-09 00:01:14 | 592.5s | 9.66s-15.34s | 11.47s-18.73s | 14.43s-30.07s | 11.08s | 2.53s-12.90s | 606ms-25.46s | 6.3-15.1 |
+| [baseline-0_3_0-e2e-20260409-004904.md](baseline/perf/baseline-0_3_0-e2e-20260409-004904.md) | E2E | 2026-04-09 00:48:47 | 356.5s | 7.41s-18.54s | 7.97s-22.68s | 7.77s-14.49s | 17.32s | 3.26s-14.99s | 611ms-14.00s | 1.1-3.6 |
 
-For `AIgentOS-GH`, E2E mode measures the actual async worker architecture introduced in v0.2.0, without the later v0.3.0 orchestrator layer. This makes it possible to separate base model/runtime behavior from async worker + persistence + event delivery overhead.
+Observed v0.3.0 E2E ranges:
+- 20-turn per-turn completion: `6.58s` to `30.07s` (throughput: `0.5-17.6 tok/s`)
+- TTFT for first conversational turn: `6.58s` to `13.65s` (orchestrator routing adds ~5-8s vs v0.2.4 E2E)
+- TTFT at ~10k system tokens: `~12.2s` (unchanged — system prompt pressure bypasses the orchestrator path)
+- System prompt pressure at ~10k system tokens: `12.90s` to `15.49s`
+- Summarization: `7.97s` to `22.68s`
+- Run duration: `357s` to `593s` (vs `254-270s` in v0.2.4 E2E)
 
-3 E2E runs on `alibayram/smollm3` with `max_response_tokens=1024`:
+**Routing instability note**: runs 3 and 5 show severely degraded 20-turn behavior (`In Tok: 0` on many turns, throughput below 2 tok/s). This happens when the orchestrator routing LLM fails to produce structured output, causing the dialogue worker to generate near-empty responses. This is a known limitation of the two-LLM-gate architecture with small local models — see Architecture Notes above.
+
+### v0.2.4-oss End-to-End Baseline (2026-04-08)
+
+3 E2E runs on `alibayram/smollm3` with `max_response_tokens=1024`. These runs measure the v0.2.0 async worker architecture **without** the v0.3.0 orchestrator layer — isolating async worker + persistence + event delivery overhead from orchestrator routing cost. They are kept here as historical comparison data for the pre-orchestrator architecture.
 
 | Report | Mode | Completed (local) | Duration | Simple Q/A min-max | Summarization min-max | 20-turn per-turn min-max | Structured extraction | System prompt pressure min-max | TTFT min-max | 20-turn tok/s |
 |---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
@@ -153,7 +199,7 @@ For `AIgentOS-GH`, E2E mode measures the actual async worker architecture introd
 | [baseline-e2e-20260408-195417.md](baseline/perf/baseline-e2e-20260408-195417.md) | E2E | 2026-04-08 19:52:02 | 269.5s | 3.27s-10.10s | 4.33s-13.80s | 3.69s-17.17s | 5.67s | 1.77s-14.58s | 658ms-12.26s | 3.9-24.0 |
 | [baseline-e2e-20260408-200126.md](baseline/perf/baseline-e2e-20260408-200126.md) | E2E | 2026-04-08 19:58:45 | 265.8s | 3.06s-12.06s | 4.19s-13.80s | 3.59s-16.61s | 5.46s | 608ms-12.26s | 608ms-12.26s | 4.3-26.9 |
 
-Observed E2E ranges:
+Observed v0.2.4 E2E ranges:
 - 20-turn per-turn completion: `2.78s` to `17.17s` (throughput: `3.9-27.4 tok/s`)
 - TTFT for first turn: `2.14s` to `5.95s`
 - TTFT at ~10k system tokens: `~12.3s` (consistent across all 3 runs)
@@ -179,7 +225,7 @@ Observed Direct model ranges:
 - System prompt pressure at ~10k system tokens: `13.28s` to `16.24s`
 - Summarization: `2.30s` to `5.28s`
 
-### v0.1.0 Baseline (2026-02-19)
+### v0.1.0 Baseline — Direct Model (2026-02-19)
 
 3 runs on `alibayram/smollm3` with `max_response_tokens=512`.
 
@@ -191,9 +237,16 @@ Observed Direct model ranges:
 
 ### Comparison Notes
 
-**E2E vs Direct model (v0.2.4-oss)**:
+**v0.3.0 E2E vs v0.2.4 E2E (orchestrator overhead)**:
+- **TTFT**: First conversational turn TTFT is `6.6s-13.7s` in v0.3.0 vs `2.1s-5.9s` in v0.2.4. The ~5-8s increase is the cost of the orchestrator routing LLM call that runs before the dialogue worker starts.
+- **20-turn throughput**: v0.3.0 shows `0.5-17.6 tok/s` vs v0.2.4's `3.9-27.4 tok/s`. The lower floor in v0.3.0 reflects routing failures that produce near-empty turns (see routing instability note above). When routing succeeds, throughput is closer to `5-15 tok/s`.
+- **Summarization**: v0.3.0 `7.97s-22.68s` vs v0.2.4 `3.77s-13.80s`. The orchestrator routing call adds consistent overhead to every turn.
+- **Run duration**: v0.3.0 runs take `357-593s` vs v0.2.4's `254-270s` — the orchestrator roughly doubles total benchmark time.
+- **System prompt pressure at ~10k tokens**: nearly identical (`12.9s-15.5s` v0.3.0 vs `13.7s-18.8s` v0.2.4) — system prompt pressure cases bypass the orchestrator's conversational routing path, so the overhead is minimal.
+
+**v0.2.4 E2E vs v0.2.0 Direct (async worker overhead)**:
 - **TTFT overhead**: First-turn TTFT in E2E mode is `2.1s-5.9s` vs `295ms-350ms` in Direct mode. The ~2s floor reflects the async worker poll cycle + event persistence + SSE delivery path that real user messages travel through. At high context sizes (~10k system tokens) the gap narrows because LLM prefill dominates (`~12.3s` E2E vs `~12.2s` Direct).
-- **20-turn throughput**: E2E shows `3.9-27.4 tok/s` vs Direct's `43-55 tok/s`. The lower E2E throughput reflects per-token DB writes (the worker updates the assistant event on each streamed chunk for real-time SSE) and polling overhead. The wider range in E2E includes occasional outlier turns with spikes up to `17s` that don't appear in Direct runs.
+- **20-turn throughput**: E2E shows `3.9-27.4 tok/s` vs Direct's `43-55 tok/s`. The lower E2E throughput reflects per-token DB writes (the worker updates the assistant event on each streamed chunk for real-time SSE) and polling overhead.
 - **Summarization**: E2E `3.77s-13.80s` vs Direct `2.30s-5.28s`. The wider E2E ceiling comes from the worker overhead on longer completions.
 - **System prompt pressure at ~10k tokens**: comparable (`13.65s-18.75s` E2E vs `13.28s-16.24s` Direct) — at this scale the LLM prefill cost dominates and the worker overhead is proportionally small.
 
@@ -206,12 +259,14 @@ Observed Direct model ranges:
 
 ### Interpretation
 
+- The baseline data now spans three tiers — **Direct model** (raw LLM), **E2E without orchestrator** (v0.2.4), and **E2E with orchestrator** (v0.3.0) — making it possible to attribute latency to each layer independently.
 - Latency is most sensitive to effective prompt size and completion length.
 - The 20-turn test shows context growth impact over time.
 - When a model emits visible thinking text, baseline `completion tokens` reflect the model's full generated output budget, which can include both `<think>...</think>` content and the final visible answer.
 - The baseline `Enforce max response tokens` option uses the current runtime `max_response_tokens` setting. If that cap is increased, baseline completion lengths and latencies may increase too.
 - **Direct model** baselines (v0.1.0, v0.2.0) measure raw LLM performance — the prompt is sent directly to the model and the response is timed. This isolates model behavior from system overhead.
-- **End-to-end AIgentOS** baselines (v0.2.4-oss) measure the real product path that a user experiences: message enqueue, async worker pickup, DB event creation, streamed token persistence, and SSE delivery. This is the more honest benchmark for evaluating actual user-facing latency on this branch.
+- **End-to-end AIgentOS** baselines (v0.2.4, v0.3.0) measure the real product path that a user experiences. v0.2.4 E2E isolates async worker overhead; v0.3.0 E2E adds orchestrator routing and tool dispatch on top.
+- The v0.3.0 orchestrator roughly doubles total benchmark time and adds 5-8s of TTFT overhead per conversational turn. On degraded runs, routing failures can collapse throughput below 2 tok/s. This is the clearest data point supporting the architecture direction described in Architecture Notes: once tool use becomes central, naive sequential orchestration is too expensive for a responsive product path.
 
 ### General Perf Dashboard (for chats)
 ![AIgentOS Perf Dashboard](baseline/ui/performance.png)

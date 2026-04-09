@@ -86,6 +86,27 @@ def load_prompt_components(repo_root: Path) -> list[PromptComponent]:
     return components
 
 
+def load_orchestrator_prompts(repo_root: Path) -> list[PromptComponent]:
+    prompts_dir = repo_root / "agent-prompts" / "orchestrator"
+    if not prompts_dir.exists():
+        return []
+    components: list[PromptComponent] = []
+    for idx, md_file in enumerate(sorted(prompts_dir.glob("*.md"))):
+        text = _read_text(md_file)
+        components.append(
+            PromptComponent(
+                id=md_file.stem,
+                name=md_file.name,
+                file_path=str(md_file.resolve()),
+                content=text,
+                order=idx,
+                enabled=True,
+                is_system=True,
+            )
+        )
+    return components
+
+
 def compose_system_prompt(components: list[PromptComponent]) -> str:
     enabled = [c.content.strip() for c in sorted(components, key=lambda x: x.order) if c.enabled and c.content.strip()]
     if not enabled:

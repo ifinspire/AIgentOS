@@ -4,6 +4,7 @@ interface SettingsModalProps {
   isOpen: boolean;
   onClose: () => void;
   modelName: string;
+  version?: string;
   backendEndpoint: string;
   healthEndpoint: string;
   backendConnected: boolean;
@@ -16,6 +17,7 @@ export function SettingsModal({
   isOpen,
   onClose,
   modelName,
+  version = "unknown",
   backendEndpoint,
   healthEndpoint,
   backendConnected,
@@ -149,7 +151,7 @@ export function SettingsModal({
                   Version
                 </div>
                 <div className="font-medium" style={{ color: 'var(--aigent-color-text)' }}>
-                  v0.2.4-oss
+                  v{version}
                 </div>
               </div>
 

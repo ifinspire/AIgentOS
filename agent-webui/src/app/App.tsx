@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { Toaster, toast } from "sonner";
-import { Activity, Bot, Brain, Cpu, Database, MessageSquare, Trash2, Zap } from "lucide-react";
+import { Activity, Bot, Brain, Cpu, Database, MessageSquare, PlugZap, RefreshCw, Server, Trash2, Wrench, Zap } from "lucide-react";
 
 import { Header } from "./components/header";
 import { Footer } from "./components/footer";
@@ -17,7 +17,10 @@ import {
   ApiContextSettings,
   ApiConversationSummary,
   ApiDebugLog,
+  ApiBackgroundUpdate,
+  ApiDocumentImport,
   ApiInteractionEvent,
+  ApiMcpServer,
   ApiMemoryChunk,
   ApiMessage,
   ApiPerformanceExchange,
@@ -45,12 +48,13 @@ interface Conversation {
   isActive?: boolean;
 }
 
-interface CapabilityUpdate {
+interface BackgroundUpdate {
   id: string;
-  capabilityName: string;
+  label: string;
   status: "success" | "error" | "processing";
   message: string;
   timestamp: string;
+  detail?: string;
   icon?: React.ReactNode;
 }
 
@@ -64,6 +68,15 @@ interface PerfExchange {
 }
 
 interface MemoryChunkView extends ApiMemoryChunk {}
+interface DocumentImportView extends ApiDocumentImport {}
+interface McpServerView extends ApiMcpServer {}
+
+const MCP_NEXT_STEPS = [
+  "Keep MarkItDown MCP as the flagship packaged example and add more optional servers over time.",
+  "Capture richer MCP provenance, latency, and failures in workflow traces and debug logs.",
+  "Replace the current manual registry form with richer validation and connection testing.",
+  "Show per-server recent call history and failures next to discovered tools.",
+];
 
 const EMPTY_PERF: ApiPerformanceMetrics = {
   total_latency_ms: 0,
@@ -107,6 +120,16 @@ function formatTokensPerSecond(completionTokens: number | null | undefined, late
   const tps = completionTokens / (latencyMs / 1000);
   if (!Number.isFinite(tps) || tps <= 0) return "-";
   return `${tps.toFixed(1)} tok/s`;
+}
+
+function formatWorkflowLabel(value: unknown) {
+  const text = String(value || "").trim();
+  if (!text) return "Step";
+  return text
+    .split(/[_\s-]+/)
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
 }
 
 function computeTokensPerSecond(completionTokens: number | null | undefined, latencyMs: number | null | undefined) {
@@ -247,6 +270,32 @@ function mapConversationEvents(events: ApiInteractionEvent[]): Message[] {
     .filter((item): item is Message => item !== null);
 }
 
+function mapBackgroundUpdate(update: ApiBackgroundUpdate): BackgroundUpdate {
+  return {
+    id: update.id,
+    label: update.label,
+    status: update.status === "failed" ? "error" : update.status === "completed" ? "success" : "processing",
+    message: update.message,
+    detail: update.detail ?? undefined,
+    payload: update.payload,
+    timestamp: formatTime(update.timestamp),
+  };
+}
+
+function dedupeBackgroundUpdates(updates: BackgroundUpdate[], limit = 30): BackgroundUpdate[] {
+  const seen = new Set<string>();
+  const deduped: BackgroundUpdate[] = [];
+
+  for (const update of updates) {
+    if (seen.has(update.id)) continue;
+    seen.add(update.id);
+    deduped.push(update);
+    if (deduped.length >= limit) break;
+  }
+
+  return deduped;
+}
+
 function buildCapabilityMessage(events: ApiInteractionEvent[], perf?: ApiPerformanceExchange | null) {
   const userEvents = events.filter((event) => event.role === "user");
   const assistantEvents = events.filter((event) => event.role === "assistant");
@@ -305,22 +354,65 @@ function mapPerfExchange(exchange: ApiPerformanceExchange): PerfExchange {
   };
 }
 
+function isManagedMcpServer(server: McpServerView): boolean {
+  return server.name === "MarkItDown MCP";
+}
+
+function buildMcpRoutingContext(mcpServers: McpServerView[]): string {
+  const enabledWithTools = mcpServers.filter((server) => server.enabled && server.discovered_tools.length > 0);
+  if (enabledWithTools.length === 0) {
+    return "No discovered MCP tools are currently available to the orchestrator.";
+  }
+  const lines = ["Additional MCP tools discovered at runtime:", ""];
+  for (const server of enabledWithTools) {
+    const serverRef = server.name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 24) || server.id.slice(0, 8);
+    for (const tool of server.discovered_tools) {
+      const toolName = typeof tool === "string" ? tool : tool.name;
+      const description = typeof tool === "object" && tool.description ? tool.description : `MCP tool \`${toolName}\` from server \`${server.name}\`.`;
+      lines.push(`- mcp::${serverRef}::${toolName} — ${description}`);
+      if (typeof tool === "object" && tool.inputSchema) {
+        const schema = tool.inputSchema as Record<string, unknown>;
+        const props = schema.properties as Record<string, Record<string, unknown>> | undefined;
+        const required = new Set(((schema.required as string[]) || []));
+        if (props) {
+          const parts: string[] = [];
+          for (const [pname, ps] of Object.entries(props)) {
+            const ptype = (ps.type as string) || "string";
+            const pdesc = (ps.description as string) || "";
+            const req = required.has(pname) ? " (required)" : "";
+            let entry = `\`${pname}\`: ${ptype}${req}`;
+            if (pdesc) entry += ` — ${pdesc}`;
+            parts.push(entry);
+          }
+          if (parts.length > 0) lines.push(`  Params: ${parts.join("; ")}`);
+        }
+      }
+    }
+  }
+  lines.push("");
+  lines.push("For MCP tools, output the exact tool identifier in TOOL and put the tool arguments object in PARAMS.");
+  lines.push("Only route to an MCP tool when the user clearly needs that tool and the tool result materially helps answer the request.");
+  return lines.join("\n");
+}
+
 export default function App() {
   const [currentView, setCurrentView] = useState<"chat" | "dashboard">("chat");
   const [messages, setMessages] = useState<Message[]>([]);
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [activeConversationId, setActiveConversationId] = useState<string | null>(null);
-  const [capabilityUpdates, setCapabilityUpdates] = useState<CapabilityUpdate[]>([]);
+  const [backgroundUpdates, setBackgroundUpdates] = useState<BackgroundUpdate[]>([]);
   const [isProcessing, setIsProcessing] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [latestPerf, setLatestPerf] = useState<ApiPerformanceMetrics>(EMPTY_PERF);
   const [perfHistory, setPerfHistory] = useState<PerfExchange[]>([]);
   const [runtimeModel, setRuntimeModel] = useState("unknown");
+  const [kernelVersion, setKernelVersion] = useState("unknown");
   const [backendConnected, setBackendConnected] = useState(false);
   const [apiEndpoint, setApiEndpoint] = useState(API_BASE_URL);
   const [isModelWarm, setIsModelWarm] = useState(false);
   const [systemPrompt, setSystemPrompt] = useState<ApiSystemPrompt | null>(null);
   const [promptComponents, setPromptComponents] = useState<ApiPromptComponent[]>([]);
+  const [orchestratorPrompts, setOrchestratorPrompts] = useState<ApiPromptComponent[]>([]);
   const [promptContentDrafts, setPromptContentDrafts] = useState<Record<string, string>>({});
   const [promptEnabledDrafts, setPromptEnabledDrafts] = useState<Record<string, boolean>>({});
   const [performanceSummary, setPerformanceSummary] = useState<ApiPerformanceSummary | null>(null);
@@ -340,6 +432,22 @@ export default function App() {
   const [memoryChunks, setMemoryChunks] = useState<MemoryChunkView[]>([]);
   const [memoryEnabled, setMemoryEnabled] = useState(true);
   const [memoryLoading, setMemoryLoading] = useState(false);
+  const [documentImports, setDocumentImports] = useState<DocumentImportView[]>([]);
+  const [mcpServers, setMcpServers] = useState<McpServerView[]>([]);
+  const [mcpForm, setMcpForm] = useState<{
+    name: string;
+    transport: "stdio" | "streamable_http";
+    command: string;
+    args: string;
+    url: string;
+  }>({
+    name: "",
+    transport: "stdio",
+    command: "",
+    args: "",
+    url: "",
+  });
+  const [attachedFileName, setAttachedFileName] = useState<string | null>(null);
   const [expandedDebugIds, setExpandedDebugIds] = useState<Record<string, boolean>>({});
   const [inputResetSignal, setInputResetSignal] = useState(0);
   const [baselineRunning, setBaselineRunning] = useState(false);
@@ -354,7 +462,7 @@ export default function App() {
   const [conversationsSidebarCollapsed, setConversationsSidebarCollapsed] = useState(false);
   const [updatesPanelCollapsed, setUpdatesPanelCollapsed] = useState(false);
   const [dashboardSidebarCollapsed, setDashboardSidebarCollapsed] = useState(false);
-  const [dashboardSection, setDashboardSection] = useState<DashboardSection>("prompts");
+  const [dashboardSection, setDashboardSection] = useState<DashboardSection>("orchestration");
 
   const refreshConversations = async (preferActiveId?: string | null) => {
     const list = await api.listConversations();
@@ -367,20 +475,30 @@ export default function App() {
     const detail = await api.getConversationEvents(conversationId);
     setActiveConversationId(conversationId);
     setMessages(mapConversationEvents(detail.events));
+    if (detail.background_updates) {
+      setBackgroundUpdates((prev) => {
+        const system = prev.filter((item) => item.id === "kernel-online" || item.id === "ollama-warmup");
+        return dedupeBackgroundUpdates([...detail.background_updates!.map(mapBackgroundUpdate), ...system]);
+      });
+    }
     await refreshConversations(conversationId);
   };
 
   const loadDashboardData = async () => {
-    const [promptData, componentsData, summaryData, contextData, debugData, memoryData] = await Promise.all([
+    const [promptData, componentsData, orchestratorPromptsData, summaryData, contextData, debugData, memoryData, importData, mcpData] = await Promise.all([
       api.getSystemPrompt(),
       api.getPromptComponents(),
+      api.getOrchestratorPrompts(),
       api.getPerformanceSummary(),
       api.getContextSettings(),
       api.getDebugLogs(50),
       api.getMemoryChunks(200),
+      api.getDocumentImports(200),
+      api.listMcpServers(),
     ]);
     setSystemPrompt(promptData);
     setPromptComponents(componentsData);
+    setOrchestratorPrompts(orchestratorPromptsData);
     setPerformanceSummary(summaryData);
     setContextSettings(contextData);
     setContextSettingsDraft({
@@ -391,6 +509,8 @@ export default function App() {
     });
     setMemoryEnabled(memoryData.memory_enabled);
     setMemoryChunks(memoryData.chunks);
+    setDocumentImports(importData);
+    setMcpServers(mcpData);
     setPromptContentDrafts(Object.fromEntries(componentsData.map((c) => [c.id, c.content])));
     setPromptEnabledDrafts(Object.fromEntries(componentsData.map((c) => [c.id, c.enabled])));
     setDebugLogs(debugData);
@@ -401,13 +521,14 @@ export default function App() {
       try {
         const health = await api.healthCheck();
         setRuntimeModel(health.model);
+        setKernelVersion(health.version ?? "unknown");
         setApiEndpoint(API_BASE_URL);
         setBackendConnected(true);
         setIsModelWarm(health.is_warm);
-        setCapabilityUpdates([
+        setBackgroundUpdates([
           {
             id: "kernel-online",
-            capabilityName: "Kernel",
+            label: "Kernel",
             status: "success",
             message: `Connected (${health.model})`,
             timestamp: "Just now",
@@ -415,7 +536,7 @@ export default function App() {
           },
           {
             id: "ollama-warmup",
-            capabilityName: "Ollama",
+            label: "Ollama",
             status: "processing",
             message: "Warming up model...",
             timestamp: "Just now",
@@ -428,7 +549,7 @@ export default function App() {
         await loadDashboardData();
         try {
           const warmup = await api.warmupLLM();
-          setCapabilityUpdates((prev) =>
+          setBackgroundUpdates((prev) =>
             prev.map((u) =>
               u.id === "ollama-warmup"
                 ? {
@@ -446,7 +567,7 @@ export default function App() {
           setIsModelWarm(true);
         } catch (error) {
           const msg = error instanceof Error ? error.message : "Warmup failed";
-          setCapabilityUpdates((prev) =>
+          setBackgroundUpdates((prev) =>
             prev.map((u) =>
               u.id === "ollama-warmup"
                 ? { ...u, status: "error", message: `Warmup failed: ${msg}`, timestamp: "Just now" }
@@ -489,7 +610,14 @@ export default function App() {
 
   useEffect(() => {
     if (currentView !== "dashboard") return;
-    if (dashboardSection === "prompts" || dashboardSection === "debug" || dashboardSection === "memory") {
+    if (
+      dashboardSection === "orchestration" ||
+      dashboardSection === "mcp" ||
+      dashboardSection === "prompts" ||
+      dashboardSection === "debug" ||
+      dashboardSection === "memory" ||
+      dashboardSection === "documents"
+    ) {
       void loadDashboardData();
     }
   }, [currentView, dashboardSection]);
@@ -514,10 +642,17 @@ export default function App() {
       try {
         const detail = JSON.parse(event.data) as {
           events: ApiInteractionEvent[];
+          background_updates?: ApiBackgroundUpdate[];
           latest_performance?: ApiPerformanceExchange | null;
           performance_summary?: ApiPerformanceSummary | null;
         };
         setMessages(mapConversationEvents(detail.events));
+        if (detail.background_updates) {
+          setBackgroundUpdates((prev) => {
+            const system = prev.filter((item) => item.id === "kernel-online" || item.id === "ollama-warmup");
+            return dedupeBackgroundUpdates([...detail.background_updates.map(mapBackgroundUpdate), ...system]);
+          });
+        }
         if (detail.latest_performance) {
           setLatestPerf(detail.latest_performance.metrics);
           setPerfHistory((prev) => {
@@ -528,23 +663,23 @@ export default function App() {
         if (detail.performance_summary) {
           setPerformanceSummary(detail.performance_summary);
         }
-        setCapabilityUpdates((prev) => {
+        setBackgroundUpdates((prev) => {
           const next = [...prev];
           const latest = next[0];
           const state = buildCapabilityMessage(detail.events, detail.latest_performance ?? null);
           const payload = {
             id: latest?.id ?? `stream-${activeConversationId}`,
-            capabilityName: "LLM",
+            label: "Chat",
             status: state.status,
             message: state.message,
             timestamp: "Just now",
             icon: <Bot className="w-4 h-4" style={{ color: "var(--aigent-color-primary)" }} />,
           };
-          if (latest && latest.capabilityName === "LLM") {
+          if (latest && latest.label === "Chat") {
             next[0] = { ...latest, ...payload };
-            return next;
+            return dedupeBackgroundUpdates(next, 20);
           }
-          return [payload, ...next].slice(0, 20);
+          return dedupeBackgroundUpdates([payload, ...next], 20);
         });
       } catch {
         // Ignore malformed SSE payloads.
@@ -570,12 +705,14 @@ export default function App() {
     let conversationId = activeConversationId;
 
     const pendingUpdateId = `${Date.now()}-pending`;
-    setCapabilityUpdates((prev) => [
+    setAttachedFileName(null);
+    setBackgroundUpdates((prev) => [
       {
         id: pendingUpdateId,
-        capabilityName: "LLM",
+        label: "Chat",
         status: "processing",
         message: "Generating response...",
+        detail: "Foreground dialogue worker",
         timestamp: "Just now",
         icon: <Bot className="w-4 h-4" style={{ color: "var(--aigent-color-primary)" }} />,
       },
@@ -601,13 +738,14 @@ export default function App() {
       await refreshConversations(response.conversation_id);
       setActiveConversationId(response.conversation_id);
 
-      setCapabilityUpdates((prev) =>
+      setBackgroundUpdates((prev) =>
         prev.map((u) =>
           u.id === pendingUpdateId
             ? {
                 ...u,
                 status: "processing",
                 message: "Queued for worker...",
+                detail: "Waiting for background processing",
                 timestamp: "Just now",
               }
             : u,
@@ -624,7 +762,7 @@ export default function App() {
           timestamp: formatTime(new Date().toISOString()),
         },
       ]);
-      setCapabilityUpdates((prev) =>
+      setBackgroundUpdates((prev) =>
         prev.map((u) =>
           u.id === pendingUpdateId
             ? { ...u, status: "error", message: msg, timestamp: "Just now" }
@@ -642,6 +780,7 @@ export default function App() {
       const created = await api.createConversation();
       setActiveConversationId(created.id);
       setMessages([]);
+      setAttachedFileName(null);
       await refreshConversations(created.id);
     } catch (error) {
       const msg = error instanceof Error ? error.message : "Failed to create conversation";
@@ -649,7 +788,57 @@ export default function App() {
     }
   };
 
+  const handleAttachDocument = async (file: File) => {
+    try {
+      setAttachedFileName(file.name);
+      let conversationId = activeConversationId;
+      if (!conversationId) {
+        const created = await api.createConversation();
+        conversationId = created.id;
+        setActiveConversationId(conversationId);
+        await refreshConversations(conversationId);
+      }
+      const imported = await api.importDocument(file, conversationId);
+      if (conversationId) {
+        await loadConversation(conversationId);
+      }
+      toast.success(
+        imported.reused_existing
+          ? `Using existing import: ${imported.filename}`
+          : `Import queued: ${imported.filename}`,
+      );
+
+      // Poll for status changes and reload conversation on each transition so
+      // both LLM-generated messages (started + done) appear as they are stored.
+      const capturedId = conversationId;
+      void (async () => {
+        const MAX_POLLS = 90;
+        const INTERVAL_MS = 2000;
+        let shownProcessing = false;
+        for (let i = 0; i < MAX_POLLS; i++) {
+          await new Promise((r) => setTimeout(r, INTERVAL_MS));
+          try {
+            const doc = await api.getDocumentImport(imported.id);
+            if (doc.status === "processing" && !shownProcessing) {
+              shownProcessing = true;
+              await loadConversation(capturedId);
+            } else if (doc.status === "completed" || doc.status === "failed") {
+              await loadConversation(capturedId);
+              return;
+            }
+          } catch {
+            // transient polling error — keep trying
+          }
+        }
+      })();
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : "Failed to import document";
+      toast.error(msg);
+    }
+  };
+
   const handleSelectConversation = (id: string) => {
+    setAttachedFileName(null);
     void loadConversation(id);
   };
 
@@ -741,10 +930,15 @@ export default function App() {
       setMessages([]);
       setConversations([]);
       setActiveConversationId(null);
+      setBackgroundUpdates([]);
       setPerfHistory([]);
       setLatestPerf(EMPTY_PERF);
+      setPerformanceSummary(null);
       setDebugLogs([]);
       setMemoryChunks([]);
+      setDocumentImports([]);
+      setMcpServers([]);
+      setAttachedFileName(null);
       setInputResetSignal((v) => v + 1);
       await loadDashboardData();
       toast.success("All local data deleted");
@@ -805,6 +999,99 @@ export default function App() {
       toast.success("Memory chunk deleted");
     } catch (error) {
       const msg = error instanceof Error ? error.message : "Failed to delete memory chunk";
+      toast.error(msg);
+    }
+  };
+
+  const handleDeleteDocumentImport = async (documentId: string, filename: string) => {
+    const confirmed = window.confirm(`Delete imported document "${filename}" and its indexed chunks?`);
+    if (!confirmed) return;
+    try {
+      await api.deleteDocumentImport(documentId);
+      setDocumentImports((prev) => prev.filter((item) => item.id !== documentId));
+      toast.success(`Deleted ${filename}`);
+      if (currentView === "dashboard" && dashboardSection === "documents") {
+        await loadDashboardData();
+      }
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : "Failed to delete document";
+      toast.error(msg);
+    }
+  };
+
+  const handleCreateMcpServer = async () => {
+    const name = mcpForm.name.trim();
+    const command = mcpForm.command.trim();
+    const url = mcpForm.url.trim();
+    if (!name) {
+      toast.error("MCP server name is required");
+      return;
+    }
+    if (mcpForm.transport === "stdio" && !command) {
+      toast.error("Stdio MCP servers require a command");
+      return;
+    }
+    if (mcpForm.transport === "streamable_http" && !url) {
+      toast.error("HTTP MCP servers require a URL");
+      return;
+    }
+    try {
+      const created = await api.createMcpServer({
+        name,
+        transport: mcpForm.transport,
+        command: mcpForm.transport === "stdio" ? command : null,
+        args: mcpForm.transport === "stdio"
+          ? mcpForm.args.split(/\s+/).map((item) => item.trim()).filter(Boolean)
+          : [],
+        url: mcpForm.transport === "streamable_http" ? url : null,
+        enabled: true,
+      });
+      setMcpServers((prev) => [...prev, created]);
+      setMcpForm({
+        name: "",
+        transport: "stdio",
+        command: "",
+        args: "",
+        url: "",
+      });
+      toast.success(`Registered MCP server: ${created.name}`);
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : "Failed to register MCP server";
+      toast.error(msg);
+    }
+  };
+
+  const handleToggleMcpServer = async (server: McpServerView) => {
+    try {
+      const updated = await api.updateMcpServer(server.id, { enabled: !server.enabled });
+      setMcpServers((prev) => prev.map((item) => (item.id === server.id ? updated : item)));
+      toast.success(`${updated.name} ${updated.enabled ? "enabled" : "disabled"}`);
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : "Failed to update MCP server";
+      toast.error(msg);
+    }
+  };
+
+  const handleRefreshMcpServer = async (server: McpServerView) => {
+    try {
+      const refreshed = await api.refreshMcpServer(server.id);
+      setMcpServers((prev) => prev.map((item) => (item.id === server.id ? refreshed : item)));
+      toast.success(`Refreshed ${refreshed.name}`);
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : "Failed to refresh MCP server";
+      toast.error(msg);
+    }
+  };
+
+  const handleDeleteMcpServer = async (server: McpServerView) => {
+    const confirmed = window.confirm(`Remove MCP server "${server.name}"?`);
+    if (!confirmed) return;
+    try {
+      await api.deleteMcpServer(server.id);
+      setMcpServers((prev) => prev.filter((item) => item.id !== server.id));
+      toast.success(`Removed ${server.name}`);
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : "Failed to delete MCP server";
       toast.error(msg);
     }
   };
@@ -902,13 +1189,11 @@ export default function App() {
     const lines: string[] = [];
     lines.push("## Baseline Results");
     lines.push("");
+    lines.push(`- Release: v${kernelVersion}`);
     lines.push(`- Model: ${result.model}`);
     lines.push(`- Mode: ${result.mode === "end_to_end_aigentos" ? "End-to-end AIgentOS" : "Direct model"}`);
     lines.push(`- Completed: ${new Date(result.completed_at).toLocaleString()}`);
     lines.push(`- Duration: ${formatMs(result.duration_ms)}`);
-    if (result.mode === "end_to_end_aigentos") {
-      lines.push(`- Note: E2E mode measures the real async AIgentOS path (chat enqueue -> worker -> assistant completion).`);
-    }
     lines.push("");
     for (const category of result.categories) {
       lines.push(`### ${category.label}`);
@@ -955,7 +1240,8 @@ export default function App() {
       String(now.getMinutes()).padStart(2, "0"),
       String(now.getSeconds()).padStart(2, "0"),
     ].join("");
-    const filename = `${baselineResult.mode === "end_to_end_aigentos" ? "baseline-e2e" : "baseline"}-${stamp}.md`;
+    const modeTag = baselineResult.mode === "end_to_end_aigentos" ? "e2e" : "direct";
+    const filename = `baseline-0_3_0-${modeTag}-${stamp}.md`;
     const blob = new Blob([buildBaselineMarkdown(baselineResult)], { type: "text/markdown" });
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
@@ -1053,6 +1339,708 @@ export default function App() {
     const maxThroughput = throughputValues.length > 0 ? Math.max(...throughputValues) : null;
 
     switch (dashboardSection) {
+      case "orchestration": {
+        const recentOperationalUpdates = backgroundUpdates.filter(
+          (item) => item.id !== "kernel-online" && item.id !== "ollama-warmup",
+        );
+        const recentToolUpdates = recentOperationalUpdates.filter(
+          (item) => item.label === "Calculator" || item.label === "Document Import" || item.label === "Writing memory",
+        );
+        return (
+          <div className="h-full overflow-y-auto p-8">
+            <div className="max-w-7xl mx-auto">
+              <div className="mb-8">
+                <h2 className="mb-2" style={{ color: "var(--aigent-color-text)" }}>
+                  Orchestration
+                </h2>
+                <p style={{ color: "var(--aigent-color-text-muted)" }}>
+                  Background planning, tool use, memory decisions, and document indexing for the v{kernelVersion} async orchestrator.
+                </p>
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-6">
+                <div className="p-6 rounded-lg" style={{ backgroundColor: "var(--aigent-color-surface)", border: "1px solid var(--aigent-color-border)" }}>
+                  <div className="flex items-center gap-3 mb-3">
+                    <Cpu className="w-6 h-6" style={{ color: "var(--aigent-color-primary)" }} />
+                    <h3 className="m-0" style={{ color: "var(--aigent-color-text)" }}>Behavior Layers</h3>
+                  </div>
+                  <div className="space-y-3 text-sm" style={{ color: "var(--aigent-color-text-muted)" }}>
+                    <div>
+                      <strong style={{ color: "var(--aigent-color-text)" }}>Dialogue Prompt:</strong> editable in the Prompts section and used by the foreground dialogue worker.
+                    </div>
+                    <div>
+                      <strong style={{ color: "var(--aigent-color-text)" }}>Orchestrator Logic:</strong> background code and model-assisted decisions for retrieval, tools, memory, and imports.
+                    </div>
+                    <div>
+                      <strong style={{ color: "var(--aigent-color-text)" }}>Deterministic Rules:</strong> hard-coded guardrails for correctness-sensitive paths like direct calculator answers.
+                    </div>
+                  </div>
+                </div>
+                <div className="p-6 rounded-lg" style={{ backgroundColor: "var(--aigent-color-surface)", border: "1px solid var(--aigent-color-border)" }}>
+                  <div className="flex items-center gap-3 mb-3">
+                    <Bot className="w-6 h-6" style={{ color: "var(--aigent-color-primary)" }} />
+                    <h3 className="m-0" style={{ color: "var(--aigent-color-text)" }}>Runtime Split</h3>
+                  </div>
+                  <div className="text-sm space-y-2" style={{ color: "var(--aigent-color-text-muted)" }}>
+                    <div>Foreground dialogue worker streams the main reply.</div>
+                    <div>Background orchestrator prepares turn context, runs internal tools, writes durable memory, and indexes imported documents.</div>
+                    <div>Latest response source: {latestPerf.response_source ?? "unknown"}.</div>
+                  </div>
+                </div>
+                <div className="p-6 rounded-lg" style={{ backgroundColor: "var(--aigent-color-surface)", border: "1px solid var(--aigent-color-border)" }}>
+                  <div className="flex items-center gap-3 mb-3">
+                    <Brain className="w-6 h-6" style={{ color: "var(--aigent-color-status-active)" }} />
+                    <h3 className="m-0" style={{ color: "var(--aigent-color-text)" }}>Memory Policy</h3>
+                  </div>
+                  <div className="text-sm space-y-2" style={{ color: "var(--aigent-color-text-muted)" }}>
+                    <div>Retrieval and writeback are orchestrator-managed.</div>
+                    <div>Conversation memory can be compacted into summaries. Imported documents remain durable `document_import` knowledge sources.</div>
+                    <div>Memory is currently {contextSettingsDraft.memory_enabled ? "enabled" : "disabled"}.</div>
+                  </div>
+                </div>
+                <div className="p-6 rounded-lg" style={{ backgroundColor: "var(--aigent-color-surface)", border: "1px solid var(--aigent-color-border)" }}>
+                  <div className="flex items-center gap-3 mb-3">
+                    <Activity className="w-6 h-6" style={{ color: "var(--aigent-color-primary)" }} />
+                    <h3 className="m-0" style={{ color: "var(--aigent-color-text)" }}>Recent Activity</h3>
+                  </div>
+                  <div className="text-3xl font-medium mb-2" style={{ color: "var(--aigent-color-text)" }}>
+                    {recentOperationalUpdates.length}
+                  </div>
+                  <p className="text-sm" style={{ color: "var(--aigent-color-text-muted)" }}>
+                    background updates in the current conversation
+                  </p>
+                  <p className="text-xs mt-1" style={{ color: "var(--aigent-color-text-muted)" }}>
+                    {recentToolUpdates.length} tool or memory action{recentToolUpdates.length === 1 ? "" : "s"} visible right now
+                  </p>
+                </div>
+              </div>
+
+              <div className="p-6 rounded-lg mb-6" style={{ backgroundColor: "var(--aigent-color-surface)", border: "1px solid var(--aigent-color-border)" }}>
+                <h3 className="m-0 mb-4" style={{ color: "var(--aigent-color-text)" }}>
+                  Native Tool Catalog
+                </h3>
+                <p className="text-sm mb-4" style={{ color: "var(--aigent-color-text-muted)" }}>
+                  These are kernel-native tools and subagents. Attached MCP tools are discovered and managed separately in the <strong>MCP</strong> dashboard section.
+                </p>
+                <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4">
+                  {[
+                    {
+                      name: "Memory Search",
+                      status: contextSettingsDraft.memory_enabled ? "Enabled" : "Disabled",
+                      detail: "Semantic retrieval over stored conversational memory and imported document chunks.",
+                    },
+                    {
+                      name: "Math",
+                      status: "Enabled",
+                      detail: "Native math flow that uses a specialized subagent for reference resolution and a deterministic calculator for exact computation.",
+                    },
+                    {
+                      name: "Document Index",
+                      status: "Enabled",
+                      detail: "Chunks, embeds, and stores imported documents as durable `document_import` RAG sources after MCP-based conversion.",
+                    },
+                  ].map((tool) => (
+                    <div
+                      key={tool.name}
+                      className="p-4 rounded-lg"
+                      style={{ backgroundColor: "var(--aigent-color-bg)", border: "1px solid var(--aigent-color-border)" }}
+                    >
+                      <div className="flex items-center justify-between gap-3 mb-2">
+                        <div className="text-sm font-medium" style={{ color: "var(--aigent-color-text)" }}>
+                          {tool.name}
+                        </div>
+                        <span
+                          className="px-2 py-1 rounded-full text-xs font-medium"
+                          style={{
+                            backgroundColor: tool.status === "Enabled" ? "rgba(34, 197, 94, 0.2)" : "rgba(148, 163, 184, 0.2)",
+                            color: tool.status === "Enabled" ? "rgb(34, 197, 94)" : "rgb(148, 163, 184)",
+                            border: `1px solid ${tool.status === "Enabled" ? "rgba(34, 197, 94, 0.4)" : "rgba(148, 163, 184, 0.4)"}`,
+                          }}
+                        >
+                          {tool.status}
+                        </span>
+                      </div>
+                      <div className="text-xs" style={{ color: "var(--aigent-color-text-muted)" }}>
+                        {tool.detail}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              <div className="p-6 rounded-lg mb-6" style={{ backgroundColor: "var(--aigent-color-surface)", border: "1px solid var(--aigent-color-border)" }}>
+                <h3 className="m-0 mb-2" style={{ color: "var(--aigent-color-text)" }}>
+                  Routing Prompts
+                </h3>
+                <p className="text-sm mb-4" style={{ color: "var(--aigent-color-text-muted)" }}>
+                  Prompts loaded by the orchestrator worker at runtime. Edit the source files in <code style={{ fontFamily: "var(--aigent-font-mono)" }}>agent-prompts/orchestrator/</code> to change routing behavior.
+                </p>
+                {orchestratorPrompts.length === 0 ? (
+                  <div className="text-sm" style={{ color: "var(--aigent-color-text-muted)" }}>No orchestrator prompts found.</div>
+                ) : (
+                  <div className="space-y-4">
+                    {orchestratorPrompts.map((prompt) => (
+                      <div key={prompt.id} className="rounded-lg overflow-hidden" style={{ border: "1px solid var(--aigent-color-border)" }}>
+                        <div className="flex items-center justify-between px-4 py-2" style={{ backgroundColor: "var(--aigent-color-bg)", borderBottom: "1px solid var(--aigent-color-border)" }}>
+                          <span className="text-sm font-medium" style={{ color: "var(--aigent-color-text)", fontFamily: "var(--aigent-font-mono)" }}>
+                            {prompt.name}
+                          </span>
+                          <span className="text-xs px-2 py-0.5 rounded-full" style={{ backgroundColor: "rgba(34,197,94,0.15)", color: "rgb(34,197,94)", border: "1px solid rgba(34,197,94,0.3)" }}>
+                            active
+                          </span>
+                        </div>
+                        <pre className="m-0 px-4 py-3 text-xs overflow-x-auto whitespace-pre-wrap break-words" style={{ color: "var(--aigent-color-text-muted)", fontFamily: "var(--aigent-font-mono)", backgroundColor: "var(--aigent-color-surface)" }}>
+                          {prompt.content}
+                        </pre>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              <div className="p-6 rounded-lg mb-6" style={{ backgroundColor: "var(--aigent-color-surface)", border: "1px solid var(--aigent-color-border)" }}>
+                <h3 className="m-0 mb-2" style={{ color: "var(--aigent-color-text)" }}>
+                  MCP Routing Context
+                </h3>
+                <p className="text-sm mb-4" style={{ color: "var(--aigent-color-text-muted)" }}>
+                  This is the runtime-generated MCP tool context currently appended to the orchestrator routing prompt. It is derived from the MCP servers and discovered tools shown in the <strong>MCP</strong> dashboard section.
+                </p>
+                <pre
+                  className="m-0 px-4 py-3 text-xs overflow-x-auto whitespace-pre-wrap break-words rounded-lg"
+                  style={{
+                    color: "var(--aigent-color-text-muted)",
+                    fontFamily: "var(--aigent-font-mono)",
+                    backgroundColor: "var(--aigent-color-bg)",
+                    border: "1px solid var(--aigent-color-border)",
+                  }}
+                >
+                  {buildMcpRoutingContext(mcpServers)}
+                </pre>
+                <div className="text-xs mt-3" style={{ color: "var(--aigent-color-text-muted)" }}>
+                  This context includes tool descriptions and parameter schemas discovered from each MCP server.
+                </div>
+              </div>
+
+              <div className="p-6 rounded-lg mb-6" style={{ backgroundColor: "var(--aigent-color-surface)", border: "1px solid var(--aigent-color-border)" }}>
+                <h3 className="m-0 mb-4" style={{ color: "var(--aigent-color-text)" }}>
+                  Latest Turn Workflow
+                </h3>
+                <div className="text-sm mb-3" style={{ color: "var(--aigent-color-text-muted)" }}>
+                  Response source: {latestPerf.response_source ?? "-"} · Policy: {latestPerf.response_policy ?? "-"} · LLM involved: {latestPerf.llm_involved ? "yes" : "no"}
+                </div>
+                {latestPerf.tool_observations && latestPerf.tool_observations.length > 0 && (
+                  <div className="mb-4 flex flex-wrap gap-2">
+                    {latestPerf.tool_observations.map((tool, idx) => (
+                      <span
+                        key={`tool-observation-${idx}`}
+                        className="px-2 py-1 rounded-full text-xs"
+                        style={{ backgroundColor: "var(--aigent-color-bg)", border: "1px solid var(--aigent-color-border)", color: "var(--aigent-color-text-muted)" }}
+                      >
+                        {String(tool["label"] || tool["tool"] || "tool")}: {String(tool["result"] || "").slice(0, 64)}
+                      </span>
+                    ))}
+                  </div>
+                )}
+                {latestPerf.workflow_trace && latestPerf.workflow_trace.length > 0 ? (
+                  <div className="space-y-3">
+                    {latestPerf.workflow_trace.map((step, idx) => (
+                      <div
+                        key={`workflow-${idx}`}
+                        className="p-4 rounded-lg"
+                        style={{ backgroundColor: "var(--aigent-color-bg)", border: "1px solid var(--aigent-color-border)" }}
+                      >
+                        <div className="flex items-center justify-between gap-3 mb-1">
+                          <div className="text-sm font-medium" style={{ color: "var(--aigent-color-text)" }}>
+                            {idx + 1}. {formatWorkflowLabel(step["step"])}
+                          </div>
+                          <div className="text-xs" style={{ color: "var(--aigent-color-text-muted)" }}>
+                            {String(step["where"] || "runtime")}
+                          </div>
+                        </div>
+                        <div className="text-xs mb-1" style={{ color: "var(--aigent-color-text-muted)" }}>
+                          Layer: {String(step["layer"] || "unknown")} · LLM involved: {step["llm_involved"] ? "yes" : "no"}
+                        </div>
+                        <div className="text-sm" style={{ color: "var(--aigent-color-text-muted)" }}>
+                          {String(step["detail"] || "")}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="text-sm" style={{ color: "var(--aigent-color-text-muted)" }}>
+                    No workflow trace yet. Send a message to populate the latest turn workflow.
+                  </div>
+                )}
+              </div>
+
+              <div className="p-6 rounded-lg mb-6" style={{ backgroundColor: "var(--aigent-color-surface)", border: "1px solid var(--aigent-color-border)" }}>
+                <h3 className="m-0 mb-4" style={{ color: "var(--aigent-color-text)" }}>
+                  Event Timeline
+                </h3>
+                <p className="text-sm mb-4" style={{ color: "var(--aigent-color-text-muted)" }}>
+                  Per-event detail from the orchestrator, including raw LLM output for routing and subagent calls.
+                </p>
+                {recentOperationalUpdates.length === 0 ? (
+                  <div className="text-sm" style={{ color: "var(--aigent-color-text-muted)" }}>
+                    No orchestration events yet. Send a message to populate the timeline.
+                  </div>
+                ) : (
+                  <div className="space-y-3">
+                    {recentOperationalUpdates.map((item) => (
+                      <div
+                        key={item.id}
+                        className="p-4 rounded-lg"
+                        style={{ backgroundColor: "var(--aigent-color-bg)", border: "1px solid var(--aigent-color-border)" }}
+                      >
+                        <div className="flex items-center justify-between gap-3 mb-1">
+                          <div className="text-sm font-medium" style={{ color: "var(--aigent-color-text)" }}>
+                            {item.label}
+                          </div>
+                          <div className="flex items-center gap-2">
+                            <span
+                              className="px-2 py-0.5 rounded-full text-xs"
+                              style={{
+                                backgroundColor: item.status === "success" ? "rgba(34,197,94,0.15)" : item.status === "error" ? "rgba(239,68,68,0.15)" : "rgba(59,130,246,0.15)",
+                                color: item.status === "success" ? "rgb(34,197,94)" : item.status === "error" ? "rgb(239,68,68)" : "rgb(59,130,246)",
+                                border: `1px solid ${item.status === "success" ? "rgba(34,197,94,0.3)" : item.status === "error" ? "rgba(239,68,68,0.3)" : "rgba(59,130,246,0.3)"}`,
+                              }}
+                            >
+                              {item.status}
+                            </span>
+                            <span className="text-xs" style={{ color: "var(--aigent-color-text-muted)" }}>{item.timestamp}</span>
+                          </div>
+                        </div>
+                        {item.detail && (
+                          <div className="text-xs mb-2" style={{ color: "var(--aigent-color-text-muted)" }}>
+                            {item.detail}
+                          </div>
+                        )}
+                        {item.payload?.routing_raw && (
+                          <div className="mt-2">
+                            <div className="text-xs font-medium mb-1" style={{ color: "var(--aigent-color-text)" }}>
+                              Routing LLM Output
+                            </div>
+                            <pre
+                              className="m-0 px-3 py-2 text-xs rounded overflow-x-auto whitespace-pre-wrap break-words"
+                              style={{ backgroundColor: "var(--aigent-color-surface)", border: "1px solid var(--aigent-color-border)", color: "var(--aigent-color-text-muted)", fontFamily: "var(--aigent-font-mono)" }}
+                            >
+                              {String(item.payload.routing_raw)}
+                            </pre>
+                          </div>
+                        )}
+                        {item.payload?.subagent_raw && (
+                          <div className="mt-2">
+                            <div className="text-xs font-medium mb-1" style={{ color: "var(--aigent-color-text)" }}>
+                              Math Subagent LLM Output
+                            </div>
+                            <pre
+                              className="m-0 px-3 py-2 text-xs rounded overflow-x-auto whitespace-pre-wrap break-words"
+                              style={{ backgroundColor: "var(--aigent-color-surface)", border: "1px solid var(--aigent-color-border)", color: "var(--aigent-color-text-muted)", fontFamily: "var(--aigent-font-mono)" }}
+                            >
+                              {String(item.payload.subagent_raw)}
+                            </pre>
+                          </div>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              <div
+                className="p-6 rounded-lg mb-6"
+                style={{ backgroundColor: "var(--aigent-color-surface)", border: "1px solid var(--aigent-color-border)" }}
+              >
+                <h3 className="m-0 mb-3" style={{ color: "var(--aigent-color-text)" }}>
+                  Orchestration Controls
+                </h3>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-3">
+                  <label className="text-sm" style={{ color: "var(--aigent-color-text-muted)" }}>
+                    Max model context window (tokens)
+                    <input
+                      type="number"
+                      value={String(contextSettings?.max_context_tokens ?? 4096)}
+                      disabled
+                      className="w-full mt-1 px-3 py-2 rounded"
+                      style={{ backgroundColor: "var(--aigent-color-bg)", border: "1px solid var(--aigent-color-border)", color: "var(--aigent-color-text-muted)" }}
+                    />
+                  </label>
+                  <label className="text-sm" style={{ color: "var(--aigent-color-text-muted)" }}>
+                    Max response tokens
+                    <input
+                      type="number"
+                      min={16}
+                      step={1}
+                      value={contextSettingsDraft.max_response_tokens}
+                      onChange={(e) =>
+                        setContextSettingsDraft((prev) => ({ ...prev, max_response_tokens: e.target.value }))
+                      }
+                      className="w-full mt-1 px-3 py-2 rounded"
+                      style={{ backgroundColor: "var(--aigent-color-bg)", border: "1px solid var(--aigent-color-border)", color: "var(--aigent-color-text)" }}
+                    />
+                  </label>
+                  <label className="text-sm" style={{ color: "var(--aigent-color-text-muted)" }}>
+                    Compact context trigger (0.1-1.0)
+                    <input
+                      type="number"
+                      min={0.1}
+                      max={1.0}
+                      step={0.01}
+                      value={contextSettingsDraft.compact_trigger_pct}
+                      onChange={(e) =>
+                        setContextSettingsDraft((prev) => ({ ...prev, compact_trigger_pct: e.target.value }))
+                      }
+                      className="w-full mt-1 px-3 py-2 rounded"
+                      style={{ backgroundColor: "var(--aigent-color-bg)", border: "1px solid var(--aigent-color-border)", color: "var(--aigent-color-text)" }}
+                    />
+                  </label>
+                  <label className="text-sm flex items-center gap-2 md:col-span-2" style={{ color: "var(--aigent-color-text-muted)" }}>
+                    <input
+                      type="checkbox"
+                      checked={contextSettingsDraft.memory_enabled}
+                      onChange={(e) =>
+                        setContextSettingsDraft((prev) => ({ ...prev, memory_enabled: e.target.checked }))
+                      }
+                    />
+                    Enable orchestrator memory retrieval and durable memory writes
+                  </label>
+                </div>
+                <label className="text-sm" style={{ color: "var(--aigent-color-text-muted)" }}>
+                  Special compact context instructions
+                  <textarea
+                    value={contextSettingsDraft.compact_instructions}
+                    onChange={(e) =>
+                      setContextSettingsDraft((prev) => ({ ...prev, compact_instructions: e.target.value }))
+                    }
+                    rows={5}
+                    className="w-full mt-1 px-3 py-2 rounded"
+                    style={{ backgroundColor: "var(--aigent-color-bg)", border: "1px solid var(--aigent-color-border)", color: "var(--aigent-color-text)" }}
+                  />
+                </label>
+                <div className="text-xs mt-2" style={{ color: "var(--aigent-color-text-muted)" }}>
+                  Current: {contextSettings?.max_context_tokens ?? 4096} context tokens · {contextSettings?.max_response_tokens ?? 1024} response tokens · trigger {(contextSettings?.compact_trigger_pct ?? 0.9) * 100}% · memory {contextSettings?.memory_enabled ? "on" : "off"}
+                </div>
+                <div className="text-xs mt-1" style={{ color: "var(--aigent-color-text-muted)" }}>
+                  Background Work will show preparation, tool use, document indexing, and memory write steps as the orchestrator runs.
+                </div>
+                <button
+                  onClick={() => void handleSaveContextSettings()}
+                  className="px-3 py-1 rounded text-sm mt-3"
+                  style={{ backgroundColor: "var(--aigent-color-primary)", color: "#fff" }}
+                >
+                  Save Orchestration Settings
+                </button>
+              </div>
+
+              <div className="p-6 rounded-lg" style={{ backgroundColor: "var(--aigent-color-surface)", border: "1px solid var(--aigent-color-border)" }}>
+                <div className="flex items-center justify-between mb-4">
+                  <h3 className="m-0" style={{ color: "var(--aigent-color-text)" }}>
+                    Recent Background Work
+                  </h3>
+                  <button
+                    onClick={() => void loadDashboardData()}
+                    className="px-3 py-2 rounded-lg text-sm"
+                    style={{ backgroundColor: "var(--aigent-color-bg)", border: "1px solid var(--aigent-color-border)", color: "var(--aigent-color-text)" }}
+                  >
+                    Refresh
+                  </button>
+                </div>
+                {recentOperationalUpdates.length === 0 ? (
+                  <div className="text-sm" style={{ color: "var(--aigent-color-text-muted)" }}>
+                    No orchestrator activity yet for this conversation.
+                  </div>
+                ) : (
+                  <div className="space-y-3">
+                    {recentOperationalUpdates.slice(0, 12).map((item) => (
+                      <div
+                        key={item.id}
+                        className="p-4 rounded-lg"
+                        style={{ backgroundColor: "var(--aigent-color-bg)", border: "1px solid var(--aigent-color-border)" }}
+                      >
+                        <div className="flex items-center justify-between gap-3 mb-1">
+                          <div className="text-sm font-medium" style={{ color: "var(--aigent-color-text)" }}>
+                            {item.label}
+                          </div>
+                          <div className="text-xs" style={{ color: "var(--aigent-color-text-muted)" }}>
+                            {item.timestamp}
+                          </div>
+                        </div>
+                        <div className="text-sm" style={{ color: "var(--aigent-color-text-muted)" }}>
+                          {item.message}
+                        </div>
+                        {item.detail && (
+                          <div className="text-xs mt-1" style={{ color: "var(--aigent-color-text-muted)" }}>
+                            {item.detail}
+                          </div>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        );
+      }
+      case "mcp":
+        return (
+          <div className="h-full overflow-y-auto p-8">
+            <div className="max-w-7xl mx-auto">
+              <div className="mb-8">
+                <h2 className="mb-2" style={{ color: "var(--aigent-color-text)" }}>
+                  MCP
+                </h2>
+                <p style={{ color: "var(--aigent-color-text-muted)" }}>
+                  Register, inspect, and eventually control attached MCP servers without digging through prompts or code.
+                </p>
+              </div>
+
+              <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                <div className="p-6 rounded-lg" style={{ backgroundColor: "var(--aigent-color-surface)", border: "1px solid var(--aigent-color-border)" }}>
+                  <div className="flex items-center gap-3 mb-4">
+                    <PlugZap className="w-6 h-6" style={{ color: "var(--aigent-color-primary)" }} />
+                    <h3 className="m-0" style={{ color: "var(--aigent-color-text)" }}>Why MCP Is Top-Level</h3>
+                  </div>
+                  <div className="space-y-3 text-sm" style={{ color: "var(--aigent-color-text-muted)" }}>
+                    <div>AIgentOS should stay simple to run, but still let a private self-hosting user connect more tools when they need them.</div>
+                    <div>`Orchestration` explains how the system routes work. `MCP` should explain which external tool servers are attached, trusted, and available.</div>
+                    <div>The bundled `MarkItDown MCP` service is the current packaged example: document import goes through MCP, while math remains native in the kernel.</div>
+                    <div>This keeps the product transparent: users can answer “what tools are connected?” without reading worker code or prompt files.</div>
+                  </div>
+                </div>
+
+                <div className="p-6 rounded-lg" style={{ backgroundColor: "var(--aigent-color-surface)", border: "1px solid var(--aigent-color-border)" }}>
+                  <div className="flex items-center gap-3 mb-4">
+                    <Server className="w-6 h-6" style={{ color: "var(--aigent-color-status-active)" }} />
+                    <h3 className="m-0" style={{ color: "var(--aigent-color-text)" }}>Implementation Status</h3>
+                  </div>
+                  <div className="space-y-2 text-sm" style={{ color: "var(--aigent-color-text-muted)" }}>
+                    <div>Dashboard section: live</div>
+                    <div>Plan docs: updated</div>
+                    <div>Registry storage: live</div>
+                    <div>Server registration UI: live</div>
+                    <div>Tool discovery and routing: live</div>
+                  </div>
+                  <div className="text-xs mt-4" style={{ color: "var(--aigent-color-text-muted)" }}>
+                    See `/docs/MCP_PLAN.md` and `/docs/V0_3_0_PLAN.md` for the current scope.
+                  </div>
+                </div>
+              </div>
+
+              <div className="mt-6 p-6 rounded-lg" style={{ backgroundColor: "var(--aigent-color-surface)", border: "1px solid var(--aigent-color-border)" }}>
+                <div className="flex items-center justify-between mb-4">
+                  <div className="flex items-center gap-3">
+                    <Server className="w-6 h-6" style={{ color: "var(--aigent-color-primary)" }} />
+                    <h3 className="m-0" style={{ color: "var(--aigent-color-text)" }}>
+                      Registered Servers
+                    </h3>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <button
+                      onClick={() => void loadDashboardData()}
+                      className="px-3 py-2 rounded-lg text-sm flex items-center gap-2"
+                      style={{ backgroundColor: "var(--aigent-color-bg)", border: "1px solid var(--aigent-color-border)", color: "var(--aigent-color-text)" }}
+                    >
+                      <RefreshCw className="w-4 h-4" />
+                      Refresh
+                    </button>
+                  </div>
+                </div>
+                <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-6">
+                  <div className="p-4 rounded-lg" style={{ backgroundColor: "var(--aigent-color-bg)", border: "1px solid var(--aigent-color-border)" }}>
+                    <div className="text-sm font-medium mb-3" style={{ color: "var(--aigent-color-text)" }}>
+                      Register MCP Server
+                    </div>
+                    <div className="space-y-3">
+                      <label className="block text-sm" style={{ color: "var(--aigent-color-text-muted)" }}>
+                        Name
+                        <input
+                          value={mcpForm.name}
+                          onChange={(e) => setMcpForm((prev) => ({ ...prev, name: e.target.value }))}
+                          className="w-full mt-1 px-3 py-2 rounded"
+                          style={{ backgroundColor: "var(--aigent-color-surface)", border: "1px solid var(--aigent-color-border)", color: "var(--aigent-color-text)" }}
+                          placeholder="Filesystem MCP"
+                        />
+                      </label>
+                      <label className="block text-sm" style={{ color: "var(--aigent-color-text-muted)" }}>
+                        Transport
+                        <select
+                          value={mcpForm.transport}
+                          onChange={(e) => setMcpForm((prev) => ({ ...prev, transport: e.target.value as "stdio" | "streamable_http" }))}
+                          className="w-full mt-1 px-3 py-2 rounded"
+                          style={{ backgroundColor: "var(--aigent-color-surface)", border: "1px solid var(--aigent-color-border)", color: "var(--aigent-color-text)" }}
+                        >
+                          <option value="stdio">stdio</option>
+                          <option value="streamable_http">streamable_http</option>
+                        </select>
+                      </label>
+                      {mcpForm.transport === "stdio" ? (
+                        <>
+                          <label className="block text-sm" style={{ color: "var(--aigent-color-text-muted)" }}>
+                            Command
+                            <input
+                              value={mcpForm.command}
+                              onChange={(e) => setMcpForm((prev) => ({ ...prev, command: e.target.value }))}
+                              className="w-full mt-1 px-3 py-2 rounded"
+                              style={{ backgroundColor: "var(--aigent-color-surface)", border: "1px solid var(--aigent-color-border)", color: "var(--aigent-color-text)" }}
+                              placeholder="python -m my_mcp_server"
+                            />
+                          </label>
+                          <label className="block text-sm" style={{ color: "var(--aigent-color-text-muted)" }}>
+                            Args
+                            <input
+                              value={mcpForm.args}
+                              onChange={(e) => setMcpForm((prev) => ({ ...prev, args: e.target.value }))}
+                              className="w-full mt-1 px-3 py-2 rounded"
+                              style={{ backgroundColor: "var(--aigent-color-surface)", border: "1px solid var(--aigent-color-border)", color: "var(--aigent-color-text)" }}
+                              placeholder="--port 8765"
+                            />
+                          </label>
+                        </>
+                      ) : (
+                        <label className="block text-sm" style={{ color: "var(--aigent-color-text-muted)" }}>
+                          URL
+                          <input
+                            value={mcpForm.url}
+                            onChange={(e) => setMcpForm((prev) => ({ ...prev, url: e.target.value }))}
+                            className="w-full mt-1 px-3 py-2 rounded"
+                            style={{ backgroundColor: "var(--aigent-color-surface)", border: "1px solid var(--aigent-color-border)", color: "var(--aigent-color-text)" }}
+                            placeholder="http://127.0.0.1:8001/mcp"
+                          />
+                        </label>
+                      )}
+                      <button
+                        onClick={() => void handleCreateMcpServer()}
+                        className="px-3 py-2 rounded-lg text-sm"
+                        style={{ backgroundColor: "var(--aigent-color-primary)", color: "#fff" }}
+                      >
+                        Register Server
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="p-4 rounded-lg" style={{ backgroundColor: "var(--aigent-color-bg)", border: "1px solid var(--aigent-color-border)" }}>
+                    <div className="text-sm font-medium mb-3" style={{ color: "var(--aigent-color-text)" }}>
+                      Current Registry Summary
+                    </div>
+                    <div className="space-y-2 text-sm" style={{ color: "var(--aigent-color-text-muted)" }}>
+                      <div>Registered servers: {mcpServers.length}</div>
+                      <div>Enabled servers: {mcpServers.filter((item) => item.enabled).length}</div>
+                      <div>Discovered tools: {mcpServers.reduce((sum, item) => sum + item.discovered_tools.length, 0)}</div>
+                      <div>Document import is already routed through MCP. Additional servers can be registered here as optional extensions.</div>
+                    </div>
+                  </div>
+                </div>
+                <div className="space-y-3">
+                  {mcpServers.length === 0 ? (
+                    <div className="text-sm" style={{ color: "var(--aigent-color-text-muted)" }}>
+                      No MCP servers registered yet.
+                    </div>
+                  ) : mcpServers.map((server) => (
+                    <div
+                      key={server.id}
+                      className="p-4 rounded-lg"
+                      style={{ backgroundColor: "var(--aigent-color-bg)", border: "1px solid var(--aigent-color-border)" }}
+                    >
+                      {isManagedMcpServer(server) && (
+                        <div
+                          className="inline-flex items-center gap-2 px-2 py-1 rounded text-xs mb-3"
+                          style={{
+                            backgroundColor: "var(--aigent-color-surface)",
+                            border: "1px solid var(--aigent-color-border)",
+                            color: "var(--aigent-color-text-muted)",
+                          }}
+                        >
+                          Bundled with AIgentOS
+                        </div>
+                      )}
+                      <div className="flex items-start justify-between gap-4">
+                        <div className="min-w-0 flex-1">
+                          <div className="text-sm font-medium mb-1" style={{ color: "var(--aigent-color-text)" }}>
+                            {server.name}
+                          </div>
+                          <div className="text-xs space-y-1" style={{ color: "var(--aigent-color-text-muted)" }}>
+                            <div>Transport: {server.transport}</div>
+                            <div>Endpoint: {server.transport === "stdio" ? (server.command || "(none)") : (server.url || "(none)")}</div>
+                            {isManagedMcpServer(server) && (
+                              <div>Role: bundled document-conversion path for uploaded files</div>
+                            )}
+                            <div>Status: {server.status}</div>
+                            <div>Enabled: {server.enabled ? "yes" : "no"}</div>
+                            <div>Created: {new Date(server.created_at).toLocaleString()}</div>
+                            {server.last_error && <div style={{ color: "var(--aigent-color-rfi-accent)" }}>Last error: {server.last_error}</div>}
+                          </div>
+                        </div>
+                        <div className="flex flex-wrap items-center gap-2">
+                          {!isManagedMcpServer(server) && (
+                            <button
+                              onClick={() => void handleToggleMcpServer(server)}
+                              className="px-3 py-2 rounded text-sm"
+                              style={{ backgroundColor: "var(--aigent-color-surface)", border: "1px solid var(--aigent-color-border)", color: "var(--aigent-color-text)" }}
+                            >
+                              {server.enabled ? "Disable" : "Enable"}
+                            </button>
+                          )}
+                          <button
+                            onClick={() => void handleRefreshMcpServer(server)}
+                            className="px-3 py-2 rounded text-sm"
+                            style={{ backgroundColor: "var(--aigent-color-surface)", border: "1px solid var(--aigent-color-border)", color: "var(--aigent-color-text)" }}
+                          >
+                            Refresh
+                          </button>
+                          {!isManagedMcpServer(server) && (
+                            <button
+                              onClick={() => void handleDeleteMcpServer(server)}
+                              className="px-3 py-2 rounded text-sm"
+                              style={{ backgroundColor: "var(--aigent-color-surface)", border: "1px solid var(--aigent-color-border)", color: "var(--aigent-color-text)" }}
+                            >
+                              Remove
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                      <div className="mt-3 text-xs" style={{ color: "var(--aigent-color-text-muted)" }}>
+                        Discovered tools: {server.discovered_tools.length > 0 ? server.discovered_tools.map((t) => typeof t === "string" ? t : t.name).join(", ") : "none yet"}
+                      </div>
+                      {isManagedMcpServer(server) && (
+                        <div className="mt-2 text-xs" style={{ color: "var(--aigent-color-text-muted)" }}>
+                          This server is auto-registered by AIgentOS and is intentionally not editable from the dashboard.
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              <div className="mt-6 grid grid-cols-1 lg:grid-cols-2 gap-6">
+                <div className="p-6 rounded-lg" style={{ backgroundColor: "var(--aigent-color-surface)", border: "1px solid var(--aigent-color-border)" }}>
+                  <div className="flex items-center gap-3 mb-4">
+                    <Wrench className="w-6 h-6" style={{ color: "var(--aigent-color-primary)" }} />
+                    <h3 className="m-0" style={{ color: "var(--aigent-color-text)" }}>Planned Tool Flow</h3>
+                  </div>
+                  <div className="space-y-2 text-sm" style={{ color: "var(--aigent-color-text-muted)" }}>
+                    <div>1. User asks for something that needs a tool.</div>
+                    <div>2. Orchestrator decides between a local tool, local subagent, or MCP tool.</div>
+                    <div>3. MCP adapter invokes the selected server tool and normalizes the result.</div>
+                    <div>4. Workflow trace records where the call ran, how long it took, and whether the final answer used the LLM.</div>
+                  </div>
+                </div>
+
+                <div className="p-6 rounded-lg" style={{ backgroundColor: "var(--aigent-color-surface)", border: "1px solid var(--aigent-color-border)" }}>
+                  <div className="flex items-center gap-3 mb-4">
+                    <PlugZap className="w-6 h-6" style={{ color: "var(--aigent-color-primary)" }} />
+                    <h3 className="m-0" style={{ color: "var(--aigent-color-text)" }}>Next Steps</h3>
+                  </div>
+                  <div className="space-y-2 text-sm" style={{ color: "var(--aigent-color-text-muted)" }}>
+                    {MCP_NEXT_STEPS.map((step) => (
+                      <div key={step}>{step}</div>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        );
       case "performance":
         return (
           <div className="h-full overflow-y-auto p-8">
@@ -1191,6 +2179,76 @@ export default function App() {
                   <p className="text-sm" style={{ color: "var(--aigent-color-text-muted)" }}>
                     No memory chunks were retrieved for the latest response.
                   </p>
+                )}
+              </div>
+            </div>
+          </div>
+        );
+      case "documents":
+        return (
+          <div className="h-full overflow-y-auto p-8">
+            <div className="max-w-7xl mx-auto">
+              <div className="mb-8">
+                <h2 className="mb-2" style={{ color: "var(--aigent-color-text)" }}>Documents</h2>
+                <p style={{ color: "var(--aigent-color-text-muted)" }}>
+                  Imported files are durable RAG sources, kept separate from compacted conversational memory, and converted through the packaged MarkItDown MCP service.
+                </p>
+              </div>
+              <div className="p-6 rounded-lg mb-6" style={{ backgroundColor: "var(--aigent-color-surface)", border: "1px solid var(--aigent-color-border)" }}>
+                <div className="text-sm space-y-2" style={{ color: "var(--aigent-color-text-muted)" }}>
+                  <div>Documents imported through the chat attachment flow are sent to the bundled MarkItDown MCP service, converted into Markdown, chunked, embedded, and stored as persistent `document_import` RAG sources.</div>
+                  <div>Unlike conversational memory, imported document chunks are not included in memory compaction rollups.</div>
+                  <div>MarkItDown is an external open-source project by Microsoft and serves as the flagship MCP example in the OSS baseline.</div>
+                </div>
+              </div>
+              <div className="p-6 rounded-lg" style={{ backgroundColor: "var(--aigent-color-surface)", border: "1px solid var(--aigent-color-border)" }}>
+                <div className="flex items-center justify-between mb-4">
+                  <h3 className="m-0" style={{ color: "var(--aigent-color-text)" }}>
+                    Imported Documents ({documentImports.length})
+                  </h3>
+                </div>
+                {documentImports.length === 0 ? (
+                  <div className="text-sm" style={{ color: "var(--aigent-color-text-muted)" }}>
+                    No documents imported yet.
+                  </div>
+                ) : (
+                  <div className="space-y-3">
+                    {documentImports.map((item) => (
+                      <div
+                        key={item.id}
+                        className="p-4 rounded-lg"
+                        style={{ backgroundColor: "var(--aigent-color-bg)", border: "1px solid var(--aigent-color-border)" }}
+                      >
+                        <div className="flex items-start justify-between gap-4">
+                          <div className="min-w-0 flex-1">
+                            <div className="text-sm font-medium mb-1" style={{ color: "var(--aigent-color-text)" }}>
+                              {item.filename}
+                            </div>
+                            <div className="text-xs space-y-1" style={{ color: "var(--aigent-color-text-muted)" }}>
+                              <div>Type: {item.media_type || "unknown"}</div>
+                              <div>Status: {item.status}</div>
+                              <div>Created: {new Date(item.created_at).toLocaleString()}</div>
+                              {item.processed_at && <div>Processed: {new Date(item.processed_at).toLocaleString()}</div>}
+                              {item.conversation_id && <div>Conversation: {item.conversation_id.slice(0, 8)}</div>}
+                              {item.error && <div style={{ color: "var(--aigent-color-rfi-accent)" }}>Error: {item.error}</div>}
+                            </div>
+                          </div>
+                          <button
+                            onClick={() => void handleDeleteDocumentImport(item.id, item.filename)}
+                            className="px-3 py-2 rounded text-sm flex items-center gap-2"
+                            style={{
+                              backgroundColor: "var(--aigent-color-surface)",
+                              border: "1px solid var(--aigent-color-border)",
+                              color: "var(--aigent-color-text)",
+                            }}
+                          >
+                            <Trash2 className="w-4 h-4" />
+                            Delete
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
                 )}
               </div>
             </div>
@@ -1355,7 +2413,7 @@ export default function App() {
                       disabled={baselineRunning}
                       onChange={(e) => setBaselineMode(e.target.value as "direct_model" | "end_to_end_aigentos")}
                       className="px-2 py-1 rounded"
-                      style={{ backgroundColor: "var(--aigent-color-surface)", color: "var(--aigent-color-text)", border: "1px solid var(--aigent-color-border)" }}
+                      style={{ backgroundColor: "var(--aigent-color-bg)", color: "var(--aigent-color-text)", border: "1px solid var(--aigent-color-border)" }}
                     >
                       <option value="direct_model">Direct model</option>
                       <option value="end_to_end_aigentos">End-to-end AIgentOS</option>
@@ -1393,7 +2451,7 @@ export default function App() {
                   Includes:
                 </div>
                 <div className="text-xs mt-2" style={{ color: "var(--aigent-color-text-muted)" }}>
-                  Mode: {baselineMode === "end_to_end_aigentos" ? "End-to-end AIgentOS (real async worker path)" : "Direct model (raw prompt/model path)"}
+                  Mode: {baselineMode === "end_to_end_aigentos" ? "End-to-end AIgentOS (workers + orchestration)" : "Direct model (raw prompt/model path)"}
                 </div>
                 <ul className="text-sm mt-2 space-y-1" style={{ color: "var(--aigent-color-text-muted)" }}>
                   <li>Simple Q/A: 100, 250, 500 user tokens</li>
@@ -1441,11 +2499,6 @@ export default function App() {
                     <div className="text-xs mt-1" style={{ color: "var(--aigent-color-text-muted)" }}>
                       Note: "User Input Est" is only the synthetic user payload estimate. "Full Prompt Tokens" is the actual model-reported total prompt size.
                     </div>
-                    {baselineResult.mode === "end_to_end_aigentos" && (
-                      <div className="text-xs mt-1" style={{ color: "var(--aigent-color-text-muted)" }}>
-                        E2E mode measures the real async AIgentOS path. System Prompt Pressure remains a direct-model synthetic stress test in 0.2.4-oss.
-                      </div>
-                    )}
                   </div>
                   {baselineResult.categories.map((category) => (
                     <div key={category.id} className="p-4 rounded-lg" style={{ backgroundColor: "var(--aigent-color-surface)", border: "1px solid var(--aigent-color-border)" }}>
@@ -1528,7 +2581,7 @@ export default function App() {
               <div className="mb-8">
                 <h2 className="mb-2" style={{ color: "var(--aigent-color-text)" }}>Prompts</h2>
                 <p style={{ color: "var(--aigent-color-text-muted)" }}>
-                  Read-only prompt components and composed system prompt.
+                  Foreground dialogue prompt components and the composed system prompt.
                 </p>
               </div>
               <div className="p-6 rounded-lg mb-6" style={{ backgroundColor: "var(--aigent-color-surface)", border: "1px solid var(--aigent-color-border)" }}>
@@ -1627,90 +2680,6 @@ export default function App() {
                     </div>
                   </div>
                 ))}
-              </div>
-              <div
-                className="p-4 rounded-lg mt-6"
-                style={{ backgroundColor: "var(--aigent-color-surface)", border: "1px solid var(--aigent-color-border)" }}
-              >
-                <h3 className="m-0 mb-3" style={{ color: "var(--aigent-color-text)" }}>
-                  Context Compaction Settings
-                </h3>
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-3">
-                  <label className="text-sm" style={{ color: "var(--aigent-color-text-muted)" }}>
-                    Max model context window (tokens)
-                    <input
-                      type="number"
-                      value={String(contextSettings?.max_context_tokens ?? 4096)}
-                      disabled
-                      className="w-full mt-1 px-3 py-2 rounded"
-                      style={{ backgroundColor: "var(--aigent-color-bg)", border: "1px solid var(--aigent-color-border)", color: "var(--aigent-color-text-muted)" }}
-                    />
-                  </label>
-                  <label className="text-sm" style={{ color: "var(--aigent-color-text-muted)" }}>
-                    Max response tokens
-                    <input
-                      type="number"
-                      min={16}
-                      step={1}
-                      value={contextSettingsDraft.max_response_tokens}
-                      onChange={(e) =>
-                        setContextSettingsDraft((prev) => ({ ...prev, max_response_tokens: e.target.value }))
-                      }
-                      className="w-full mt-1 px-3 py-2 rounded"
-                      style={{ backgroundColor: "var(--aigent-color-bg)", border: "1px solid var(--aigent-color-border)", color: "var(--aigent-color-text)" }}
-                    />
-                  </label>
-                  <label className="text-sm" style={{ color: "var(--aigent-color-text-muted)" }}>
-                    Compact context trigger (0.1-1.0)
-                    <input
-                      type="number"
-                      min={0.1}
-                      max={1.0}
-                      step={0.01}
-                      value={contextSettingsDraft.compact_trigger_pct}
-                      onChange={(e) =>
-                        setContextSettingsDraft((prev) => ({ ...prev, compact_trigger_pct: e.target.value }))
-                      }
-                      className="w-full mt-1 px-3 py-2 rounded"
-                      style={{ backgroundColor: "var(--aigent-color-bg)", border: "1px solid var(--aigent-color-border)", color: "var(--aigent-color-text)" }}
-                    />
-                  </label>
-                  <label className="text-sm flex items-center gap-2 md:col-span-2" style={{ color: "var(--aigent-color-text-muted)" }}>
-                    <input
-                      type="checkbox"
-                      checked={contextSettingsDraft.memory_enabled}
-                      onChange={(e) =>
-                        setContextSettingsDraft((prev) => ({ ...prev, memory_enabled: e.target.checked }))
-                      }
-                    />
-                    Enable memory retrieval and memory writes
-                  </label>
-                </div>
-                <label className="text-sm" style={{ color: "var(--aigent-color-text-muted)" }}>
-                  Special compact context instructions
-                  <textarea
-                    value={contextSettingsDraft.compact_instructions}
-                    onChange={(e) =>
-                      setContextSettingsDraft((prev) => ({ ...prev, compact_instructions: e.target.value }))
-                    }
-                    rows={5}
-                    className="w-full mt-1 px-3 py-2 rounded"
-                    style={{ backgroundColor: "var(--aigent-color-bg)", border: "1px solid var(--aigent-color-border)", color: "var(--aigent-color-text)" }}
-                  />
-                </label>
-                <div className="text-xs mt-2" style={{ color: "var(--aigent-color-text-muted)" }}>
-                  Current: {contextSettings?.max_context_tokens ?? 4096} context tokens · {contextSettings?.max_response_tokens ?? 512} response tokens · trigger {(contextSettings?.compact_trigger_pct ?? 0.9) * 100}% · memory {contextSettings?.memory_enabled ? "on" : "off"}
-                </div>
-                <div className="text-xs mt-1" style={{ color: "var(--aigent-color-text-muted)" }}>
-                  Verification: Agent Updates will show "Context compacted" when compaction is applied.
-                </div>
-                <button
-                  onClick={() => void handleSaveContextSettings()}
-                  className="px-3 py-1 rounded text-sm mt-3"
-                  style={{ backgroundColor: "var(--aigent-color-primary)", color: "#fff" }}
-                >
-                  Save Context Settings
-                </button>
               </div>
             </div>
           </div>
@@ -1819,6 +2788,7 @@ export default function App() {
             onSectionChange={setDashboardSection}
             isCollapsed={dashboardSidebarCollapsed}
             onToggleCollapse={() => setDashboardSidebarCollapsed(!dashboardSidebarCollapsed)}
+            version={kernelVersion}
           />
         )}
 
@@ -1846,6 +2816,8 @@ export default function App() {
           {currentView === "chat" && (
             <InputArea
               onSend={handleSendMessage}
+              onAttach={handleAttachDocument}
+              attachedFileName={attachedFileName}
               isProcessing={isProcessing}
               resetSignal={inputResetSignal}
               validateMessage={getInputContextError}
@@ -1856,7 +2828,7 @@ export default function App() {
 
         {currentView === "chat" && (
           <CapabilityUpdatesPanel
-            updates={capabilityUpdates}
+            updates={backgroundUpdates}
             isCollapsed={updatesPanelCollapsed}
             onToggleCollapse={() => setUpdatesPanelCollapsed(!updatesPanelCollapsed)}
           />
@@ -1867,6 +2839,7 @@ export default function App() {
         isOpen={settingsOpen}
         onClose={() => setSettingsOpen(false)}
         modelName={runtimeModel}
+        version={kernelVersion}
         backendEndpoint={apiEndpoint}
         healthEndpoint={`${apiEndpoint}/health`}
         backendConnected={backendConnected}

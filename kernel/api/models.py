@@ -9,6 +9,7 @@ Role = Literal["system", "user", "assistant"]
 
 class HealthResponse(BaseModel):
     status: Literal["ok"]
+    version: str
     tenant_id: str
     model: str
     ollama_base_url: str
@@ -61,6 +62,7 @@ class ConversationEventsResponse(BaseModel):
     title: str
     updated_at: datetime
     events: list[InteractionEventResponse]
+    background_updates: list["BackgroundUpdateResponse"] = Field(default_factory=list)
 
 
 class PromptBreakdown(BaseModel):
@@ -95,6 +97,11 @@ class PerformanceMetrics(BaseModel):
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
     total_tokens: int | None = None
+    response_source: str | None = None
+    response_policy: str | None = None
+    llm_involved: bool = True
+    tool_observations: list[dict] = Field(default_factory=list)
+    workflow_trace: list[dict] = Field(default_factory=list)
     retrieved_chunk_count: int = 0
     retrieved_chunks: list[RetrievedMemoryChunk] = Field(default_factory=list)
     prompt_breakdown: PromptBreakdown
@@ -200,6 +207,63 @@ class MemoryChunkListResponse(BaseModel):
     chunks: list[MemoryChunkResponse]
 
 
+class BackgroundUpdateResponse(BaseModel):
+    id: str
+    label: str
+    status: Literal["pending", "processing", "completed", "failed"]
+    message: str
+    detail: str | None = None
+    payload: dict | None = None
+    timestamp: datetime
+
+
+class DocumentImportResponse(BaseModel):
+    id: str
+    conversation_id: str | None = None
+    filename: str
+    media_type: str
+    reused_existing: bool = False
+    status: Literal["pending", "processing", "completed", "failed"]
+    created_at: datetime
+    processed_at: datetime | None = None
+    error: str | None = None
+
+
+class McpServerResponse(BaseModel):
+    id: str
+    name: str
+    transport: Literal["stdio", "streamable_http"]
+    command: str | None = None
+    args: list[str] = Field(default_factory=list)
+    url: str | None = None
+    env: dict[str, str] = Field(default_factory=dict)
+    enabled: bool
+    status: str
+    last_error: str | None = None
+    discovered_tools: list[dict] = Field(default_factory=list)
+    created_at: datetime
+    updated_at: datetime
+
+
+class McpServerCreateRequest(BaseModel):
+    name: str = Field(..., min_length=1, max_length=128)
+    transport: Literal["stdio", "streamable_http"]
+    command: str | None = Field(default=None, max_length=2048)
+    args: list[str] = Field(default_factory=list)
+    url: str | None = Field(default=None, max_length=2048)
+    env: dict[str, str] = Field(default_factory=dict)
+    enabled: bool = True
+
+
+class McpServerUpdateRequest(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=128)
+    command: str | None = Field(default=None, max_length=2048)
+    args: list[str] | None = None
+    url: str | None = Field(default=None, max_length=2048)
+    env: dict[str, str] | None = None
+    enabled: bool | None = None
+
+
 class TokenWindowStats(BaseModel):
     total_tokens: int
     prompt_tokens: int
@@ -266,7 +330,7 @@ class BaselineCategoryResult(BaseModel):
 
 class BaselineRunResponse(BaseModel):
     model: str
-    mode: Literal["direct_model", "end_to_end_aigentos"]
+    mode: Literal["direct_model", "end_to_end_aigentos"] = "direct_model"
     started_at: datetime
     completed_at: datetime
     duration_ms: int
