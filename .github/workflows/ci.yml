@@ -12,16 +12,26 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - name: Syntax compile kernel in Docker Compose
+        run: docker compose run --rm kernel-test python -m compileall kernel
+
+      - name: Run BVT tests in Docker Compose
+        run: docker compose run --rm kernel-test sh -c "mkdir -p test-results && pytest -v tests -m bvt --junitxml=test-results/unit-pytest.xml"
+
+      - name: Publish unit test report
+        if: always()
+        uses: mikepenz/action-junit-report@v4
         with:
-          python-version: "3.11"
+          report_paths: test-results/unit-pytest.xml
+          fail_on_failure: true
+          detailed_summary: true
 
-      - name: Install kernel deps
-        run: pip install -r requirements.txt
-
-      - name: Syntax compile kernel
-        run: python -m compileall kernel
+      - name: Upload unit test artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-test-report
+          path: test-results/unit-pytest.xml
 
   webui-build:
     runs-on: ubuntu-latest
