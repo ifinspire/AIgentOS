@@ -138,7 +138,7 @@ Current kernel endpoints include:
   - `v0.3.0` async orchestration adds real control-plane cost because a turn may now require routing, subagent planning, and tool execution before the assistant can respond
   - even with streaming, richer tool use makes the system feel meaningfully slower than plain async chat
   - on local hardware, that extra orchestration cost is not just a latency issue; it also increases sustained load, heat, fan activity, and battery/energy usage
-  - this tradeoff is one of the clearest reasons the broader OSCAR architecture exists: once tool use becomes central, naive orchestration is too expensive unless the system separates fast-path interaction from heavier background capability work much more deliberately
+  - this tradeoff is one of the clearest reasons a more advanced async capability architecture is needed: once tool use becomes central, naive orchestration is too expensive unless the system separates fast-path interaction from heavier background capability work much more deliberately
 - **Why v0.4.0 exists**:
   - `v0.2.0` proves that async RAG can preserve a chat-like feel
   - `v0.3.0` proves that richer capability layers are valuable but expensive
